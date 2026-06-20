@@ -7318,5 +7318,24 @@ def render_buy_markdown(buy3: list[dict[str, Any]], counts: dict[str, int]) -> s
     return "\n".join(lines).strip() + "\n"
 
 
+def _persist_failed_status(exc: Exception) -> None:
+    try:
+        prev = read_json_if_exists(OUTPUTS / "pipeline_status.json", {})
+        run_mode = (prev.get("run_mode") if isinstance(prev, dict) else None) or "formal"
+        write_json(OUTPUTS / "pipeline_status.json", {
+            "overall_status": "failed",
+            "can_publish_buy_report": False,
+            "run_mode": run_mode,
+            "blocking_reasons": [f"{type(exc).__name__}: {exc}"],
+            "error": {"type": type(exc).__name__, "message": str(exc)[:300]}
+        })
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        _persist_failed_status(exc)
+        raise
