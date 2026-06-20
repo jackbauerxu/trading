@@ -1,0 +1,20 @@
+{
+  "date": "2026-06-15",
+  "source": "Serenity Analysis + X cross-check",
+  "signals": [
+    {"symbol": "LITE", "name": "Lumentum", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 370, "themes": ["AI capex", "CPO/光互连", "材料/光子瓶颈", "出口管制"], "requires_verification": true, "reason": "分析站排名第 1；上涨解释偏未来收入、材料/光子瓶颈、ASP、催化和 float dynamics，仍需订单或公司事实确认。"},
+    {"symbol": "NVDA", "name": "英伟达", "source": "Serenity Analysis + X", "stance": "看多 / 高风险偏多", "priority": 364, "themes": ["AI capex", "800V DC", "CPO/光互连", "数据中心电力链"], "requires_verification": true, "reason": "分析站排名第 2；X 线索称 NVDA/GOOGL 800V DC 提前到 2026 Q3 小批量出货，需公司披露或供应链事实确认。"},
+    {"symbol": "AAOI", "name": "Applied Optoelectronics", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 338, "themes": ["CPO/光互连", "材料/光子瓶颈"], "requires_verification": true, "reason": "分析站排名第 3；受同一社交流线索带动，但缺新增一手公司事实。"},
+    {"symbol": "MRVL", "name": "Marvell", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 338, "themes": ["AI 定制芯片", "AWS Trainium", "AI capex"], "requires_verification": true, "reason": "AI 定制芯片叙事延续，但涨幅和估值敏感，需订单、客户集中度和毛利率兑现。"},
+    {"symbol": "GOOGL", "name": "谷歌A", "source": "Serenity Analysis + X", "stance": "中性 / 观察", "priority": 302, "themes": ["800V DC", "AI 价格战", "数据中心电力链"], "requires_verification": true, "reason": "X 线索称 GOOGL 与 NVDA 800V DC 进度提前；同时 AI 降价和监管压力仍需监控。"},
+    {"symbol": "SNDK", "name": "SanDisk", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 296, "themes": ["存储", "AI capex"], "requires_verification": true, "reason": "作者高频看多未变，但情绪过热信号增加。"},
+    {"symbol": "IREN", "name": "IREN", "source": "Serenity Analysis", "stance": "看空 / 谨慎", "priority": 289, "themes": ["AI 数据中心", "股本供给风险"], "requires_verification": true, "reason": "大额 ATM 供给是核心约束，需读原始文件。"},
+    {"symbol": "MSTR", "name": "Strategy", "source": "Serenity Analysis", "stance": "中性 / 高风险观察", "priority": 286, "themes": ["BTC proxy", "高波动"], "requires_verification": true, "reason": "作者此前出清，内部人卖出和估值提示强化谨慎。"},
+    {"symbol": "RKLB", "name": "Rocket Lab", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 285, "themes": ["航天", "股本供给风险"], "requires_verification": true, "reason": "最高 30 亿美元 ATM/远期售股安排仍是稀释变量。"},
+    {"symbol": "AMD", "name": "AMD", "source": "Serenity Analysis", "stance": "看多 / 高风险偏多", "priority": 283, "themes": ["AI capex", "先进封装", "台湾投资"], "requires_verification": true, "reason": "Reuters/Amkor/台湾投资线索延续，但存在相对资金分流风险。"},
+    {"symbol": "VRT", "name": "Vertiv", "source": "X cross-check", "stance": "800V DC 受益者假设 / 待验证", "priority": 260, "themes": ["800V DC", "数据中心电力链"], "requires_verification": true, "reason": "被点名为 800V DC 受益者，需确认订单、客户、产能或供应关系。"},
+    {"symbol": "ETN", "name": "伊顿", "source": "X cross-check", "stance": "800V DC 受益者假设 / 待验证", "priority": 245, "themes": ["800V DC", "数据中心电力链"], "requires_verification": true, "reason": "被点名为 800V DC 电力链受益者，需用一手订单或供应关系确认。"},
+    {"symbol": "AXTI", "name": "AXT", "source": "X cross-check", "stance": "看多 / 待验证", "priority": 240, "themes": ["上游材料", "出口管制", "AI capex"], "requires_verification": true, "reason": "上游供应链瓶颈线索，需 capex、订单、客户或供应链文件确认。"},
+    {"symbol": "IQE", "name": "IQE", "source": "X cross-check", "stance": "看多 / 待验证", "priority": 230, "themes": ["Epiwafers", "材料瓶颈"], "requires_verification": true, "reason": "VPEC epiwafers 涨价读通，需公司和供应链事实确认。"}
+  ]
+}

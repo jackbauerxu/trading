@@ -1,0 +1,30 @@
+# ===== 敏感配置（含 API key，绝不入库）=====
+config.env
+.env
+*.env
+*.env.bak*
+config.env.bak*
+!config.env.example
+
+# ===== venv（共约 3.2G）=====
+.vibe-trading-venv/
+.kronos-venv/
+.openbb-venv/
+*-venv/
+.venv/
+
+# ===== 运行产物 / 日志 =====
+work/
+outputs/
+backups/
+external_briefs/
+external_x_posts/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.log
+
+# ===== 历史备份文件 =====
+*.bak
+*.bak.*
+*.bak_*
