@@ -7250,14 +7250,39 @@ def main() -> None:
         "research": len(trading),
         "committee": len(final_rows),
     }
-    markdown = humanize_report_chinese(render_final_markdown(final_rows, buy_rows, counts, watch))
+    run_mode = env.get("PIPELINE_RUN_MODE", "formal")
+    should_send = args.send_telegram or env.get("PIPELINE_SEND_TELEGRAM", "1") == "1"
+    flow_status = build_flow_status(
+        env=env,
+        run_mode=run_mode,
+        counts=counts,
+        trading=trading,
+        uzi=uzi,
+        vibe_review=vibe_review,
+        final_report_written=True,
+        telegram_enabled=should_send,
+        telegram_sent=None,
+    )
+    markdown = humanize_report_chinese(
+        render_final_markdown(final_rows, buy_rows, counts, watch=watch, flow_status=flow_status)
+    )
     write_text(OUTPUTS / "final_top10.md", markdown)
     write_text(OUTPUTS / "buy_top3.md", render_buy_markdown(buy_rows, counts))
     print(markdown)
 
-    should_send = args.send_telegram or env.get("PIPELINE_SEND_TELEGRAM", "1") == "1"
+    write_json(OUTPUTS / "pipeline_status.json", flow_status)
+
     if should_send:
-        telegram_send(env, markdown)
+        try:
+            text_to_send = telegram_text_for_status(markdown, flow_status)
+            telegram_send(env, text_to_send)
+            flow_status["telegram_sent"] = True
+        except Exception:
+            flow_status["telegram_sent"] = False
+            write_json(OUTPUTS / "pipeline_status.json", flow_status)
+            raise
+        write_json(OUTPUTS / "pipeline_status.json", flow_status)
+
     print(f"Pipeline completed in {time.time() - started:.1f}s")
 
 
