@@ -231,6 +231,7 @@ def test_fetch_pipeline_fundamentals_uses_quote_fallback_and_tracks_field_source
     monkeypatch.setattr(r, "fetch_yahoo_fundamentals", lambda symbol, env: {})
     monkeypatch.setattr(r, "fetch_eastmoney_fundamentals", lambda symbol, env: {})
     monkeypatch.setattr(r, "fetch_sec_fundamentals", lambda symbol, env: {})
+    monkeypatch.setattr(r, "fetch_akshare_hk_valuation", lambda symbol: {})
     monkeypatch.setattr(r, "fetch_quote_fallback_fundamentals", lambda symbol: {
         "source": "QuoteFallback/TencentQuote",
         "name": "Tencent Holdings",
@@ -309,6 +310,78 @@ def test_build_uzi_seed_raw_embeds_field_sources() -> None:
 
     assert raw["field_sources"]["price"] == "QuoteFallback/TencentQuote"
     assert raw["dimensions"]["0_basic"]["data"]["field_sources"]["pb"] == "QuoteFallback/TencentQuote"
+
+
+def test_fetch_akshare_hk_valuation_prefers_eniu_and_baidu(monkeypatch) -> None:
+    class FakeAk:
+        @staticmethod
+        def stock_hk_eniu_indicator(symbol, indicator):
+            assert symbol == "00522"
+            if indicator == "市盈率":
+                return [{"日期": "2026-06-19", "市盈率": 342.3}]
+            if indicator == "市净率":
+                return [{"日期": "2026-06-19", "市净率": 6.8}]
+            if indicator == "市值":
+                return [{"日期": "2026-06-19", "总市值": 122100000000.0}]
+            return []
+
+        @staticmethod
+        def stock_hk_valuation_baidu(symbol, indicator):
+            assert symbol == "00522"
+            if indicator == "总市值":
+                return [{"date": "2026-06-19", "value": "1221亿"}]
+            if indicator == "市净率":
+                return [{"date": "2026-06-19", "value": 6.8}]
+            return []
+
+    monkeypatch.setattr(r, "import_akshare_module", lambda: FakeAk)
+
+    data = r.fetch_akshare_hk_valuation("hk00522")
+
+    assert data["source"] == "AKShareHKValuation"
+    assert data["pe"] == 342.3
+    assert data["pb"] == 6.8
+    assert data["market_cap_raw"] == 122100000000.0
+    assert data["market_cap_yi"] == 1221.0
+    assert data["_field_sources"]["pb"] == "AKShareHKValuation"
+
+
+def test_fetch_pipeline_fundamentals_adds_akshare_for_hk_when_valuation_missing(monkeypatch) -> None:
+    monkeypatch.setattr(r, "fetch_fmp_fundamentals", lambda symbol, env: {})
+    monkeypatch.setattr(r, "fetch_alpha_overview", lambda symbol, env: {})
+    monkeypatch.setattr(r, "fetch_yahoo_fundamentals", lambda symbol, env: {})
+    monkeypatch.setattr(r, "fetch_eastmoney_fundamentals", lambda symbol, env: {
+        "source": "Eastmoney",
+        "eps": 0.61,
+        "revenue_history": [260.0, 318.0],
+        "net_profit_history": [3.5, 6.1],
+        "roe_history": [5.2, 8.6],
+    })
+    monkeypatch.setattr(r, "fetch_sec_fundamentals", lambda symbol, env: {})
+    monkeypatch.setattr(r, "fetch_marketdata_valuation_fallback", lambda symbol, env, merged: {})
+    monkeypatch.setattr(r, "fetch_akshare_hk_valuation", lambda symbol: {
+        "source": "AKShareHKValuation",
+        "market_cap_raw": 122100000000.0,
+        "market_cap_yi": 1221.0,
+        "pb": 6.8,
+        "pe": 342.3,
+        "_field_sources": {
+            "market_cap_raw": "AKShareHKValuation",
+            "market_cap_yi": "AKShareHKValuation",
+            "pb": "AKShareHKValuation",
+            "pe": "AKShareHKValuation",
+        },
+    })
+    monkeypatch.setattr(r, "fetch_quote_fallback_fundamentals", lambda symbol: {})
+
+    data = r.fetch_pipeline_fundamentals("hk00522", {})
+
+    assert data["eps"] == 0.61
+    assert data["pb"] == 6.8
+    assert data["market_cap_raw"] == 122100000000.0
+    assert data["market_cap_yi"] == 1221.0
+    assert data["source"] == "Eastmoney+AKShareHKValuation"
+    assert data["_field_sources"]["market_cap_yi"] == "AKShareHKValuation"
 
 
 def test_build_enriched_stock_data_merges_market_candidate_and_fundamentals(monkeypatch) -> None:
@@ -520,6 +593,131 @@ def test_report_sanitizes_raw_agent_prices_for_any_symbol() -> None:
     assert "止损 $368.00" in p_row["reason"]
 
 
+def test_risk_capped_score_keeps_raw_score_and_uses_clear_report_label() -> None:
+    rows = r.merge_scores(
+        candidates=[{
+            "symbol": "STX",
+            "name": "Seagate",
+            "score": 90,
+            "close": 1070.23,
+        }],
+        trading=[{
+            "symbol": "STX",
+            "name": "Seagate",
+            "action": "BUY",
+            "confidence": 0.8625,
+            "risk": "medium",
+            "ta_status": "full",
+            "reason": "深度研究通过",
+        }],
+        uzi=[{
+            "symbol": "STX",
+            "name": "Seagate",
+            "status": "ok",
+            "uzi_score": 55,
+            "rating": "观察",
+            "reason": "投委偏谨慎",
+            "quality_flags": ["UZI 投委分低于 60"],
+        }],
+        top_n=1,
+    )
+
+    row = rows[0]
+    assert row["raw_total_score"] == 78.0
+    assert row["risk_adjusted_score"] == 59.0
+    assert row["total_score"] == 59.0
+
+    markdown = r.render_final_markdown(rows, [], {"universe": 1, "openbb": 1, "screen": 1, "research": 1, "committee": 1})
+
+    assert "风控后综合分：59.0" in markdown
+    assert "原始综合分：78.0" in markdown
+    assert not any(line.startswith("综合分：") for line in markdown.splitlines())
+
+
+def test_hold_with_zero_new_position_is_worded_as_no_new_buy() -> None:
+    row = {
+        "symbol": "GE",
+        "name": "GE Aerospace",
+        "total_score": 59.0,
+        "raw_total_score": 69.61,
+        "risk_adjusted_score": 59.0,
+        "dsa_score": 76.51,
+        "tradingagents_score": 76.51,
+        "uzi_score": 53.5,
+        "raw_uzi_score": 53.5,
+        "committee_score_source": "备用投委评分",
+        "rating": "回避",
+        "action": "持有",
+        "risk": "中",
+        "ta_status": "full",
+        "buy_eligible": False,
+        "trade_bucket": "D",
+        "trade_bucket_label": "D档 Watch Only",
+        "trade_trigger": "只观察；硬性闸门未通过。",
+        "quality_gates": ["UZI 投委分低于 60"],
+        "quality_note": "UZI 投委分低于 60",
+        "pretrade_audit": {"passed": True, "gates": [], "checks": []},
+        "trade_advice": "只观察，不建议新开仓",
+        "buy_advice": "不买入",
+        "sell_advice": "跌破止损退出",
+        "position_advice": "建议 0% 新仓；已有仓位按原计划风控",
+        "price_plan": "参考价 $200.00；回踩区 $190.00-$198.00；突破确认 $205.00；止损 $180.00；止盈 $220.00 / $240.00。",
+        "reference_price": "$200.00",
+        "buy_zone": "$190.00-$198.00",
+        "breakout_price": "$205.00",
+        "stop_loss": "$180.00",
+        "take_profit_1": "$220.00",
+        "take_profit_2": "$240.00",
+        "reason": "硬性闸门未通过",
+    }
+
+    markdown = r.render_final_markdown([row], [], {"universe": 1, "openbb": 1, "screen": 1, "research": 1, "committee": 1})
+
+    assert "操作：持有" in markdown
+    assert "仓位建议：空仓不买，已有仓位按止损止盈管理" in markdown
+    assert "仓位建议：建议 0% 新仓" not in markdown
+
+
+def test_report_row_removes_tool_unavailable_error_from_stored_reasons() -> None:
+    row = {
+        "symbol": "GS",
+        "name": "Goldman Sachs",
+        "total_score": 59.0,
+        "raw_total_score": 65.57,
+        "risk_adjusted_score": 59.0,
+        "dsa_score": 70,
+        "tradingagents_score": 70,
+        "uzi_score": 50,
+        "raw_uzi_score": 50,
+        "committee_score_source": "备用投委评分",
+        "rating": "回避",
+        "action": "持有",
+        "risk": "中",
+        "ta_status": "full",
+        "buy_eligible": False,
+        "trade_bucket": "D",
+        "trade_bucket_label": "D档 Watch Only",
+        "quality_gates": ["UZI 投委分低于 60"],
+        "quality_note": "UZI 投委分低于 60",
+        "pretrade_audit": {"passed": True, "gates": [], "checks": []},
+        "trade_advice": "只观察，不建议新开仓",
+        "buy_advice": "不买入",
+        "sell_advice": "跌破止损退出",
+        "position_advice": "空仓不买，已有仓位按止损止盈管理",
+        "tradingagents_reason": "注意：按要求已尝试调用 get_verified_market_snapshot，但工具返回不可用错误；因此下列精确数值来自指标输出。盈利修复仍然有效。",
+        "uzi_reason": "复核偏谨慎。",
+        "reason": "工具返回不可用错误；盈利修复仍然有效。",
+    }
+
+    prepared = r.prepare_report_row(row)
+    combined = "\n".join(str(prepared.get(key, "")) for key in ("reason", "tradingagents_reason", "uzi_reason"))
+
+    assert "工具返回不可用错误" not in combined
+    assert "不可用错误" not in combined
+    assert "get_verified_market_snapshot" not in combined
+    assert "盈利修复仍然有效" in combined
+
+
 def test_strip_actionable_price_sentences_keeps_non_execution_metrics() -> None:
     text = "20日涨跌 12.3%，量比 1.45，PE 18.2；当前价 42.1 高于买区 40.2-42.6；跌破 36.8 退出。"
     out = r.strip_actionable_price_sentences(text)
@@ -702,8 +900,28 @@ def test_fetch_marketdata_valuation_fallback_survives_one_source_error(monkeypat
     assert round(data["pe"], 2) == 15.23
 
 
-def test_normalize_marketdata_quote_price_corrects_known_10x_feed() -> None:
-    assert round(r.normalize_marketdata_quote_price("STX", 1031.34), 3) == 103.134
+def test_normalize_marketdata_quote_price_keeps_stx_high_price_scale() -> None:
+    assert round(r.normalize_marketdata_quote_price("STX", 1031.34), 3) == 1031.34
+
+
+def test_anchor_fundamentals_to_market_price_recalculates_10x_stale_valuation() -> None:
+    data = r.anchor_fundamentals_to_market_price(
+        {
+            "price": 103.134,
+            "eps": 8.71,
+            "shares_outstanding": 217000000,
+            "market_cap_raw": 22380078000,
+            "market_cap_yi": 223.80078,
+            "pe": 11.84,
+        },
+        1070.23,
+        "global/sina_kline",
+    )
+
+    assert data["price"] == 1070.23
+    assert round(data["pe"], 2) == 122.87
+    assert round(data["market_cap_raw"], 0) == 232239910000
+    assert data["_field_sources"]["price"] == "global/sina_kline"
 
 
 def test_fetch_pipeline_fundamentals_uses_marketdata_valuation_fallback(monkeypatch) -> None:
@@ -720,7 +938,7 @@ def test_fetch_pipeline_fundamentals_uses_marketdata_valuation_fallback(monkeypa
         "source": "SEC",
         "eps": 6.77,
     })
-    monkeypatch.setattr(r, "fetch_marketdata_valuation_fallback", lambda symbol, env: {
+    monkeypatch.setattr(r, "fetch_marketdata_valuation_fallback", lambda symbol, env, merged=None: {
         "source": "Polygon+SECValuation",
         "price": 103.13,
         "shares_outstanding": 210000000.0,

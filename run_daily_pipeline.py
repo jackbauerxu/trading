@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import math
 import os
@@ -57,6 +58,14 @@ def build_env() -> dict[str, str]:
         env["TRADINGAGENTS_LLM_BACKEND_URL"] = env["OPENAI_BASE_URL"]
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("NOTIFICATION_REPORT_CHANNELS", "telegram")
+    # Override python executables with correct venv paths (config.env often has wrong system python)
+    dsa_venv = ROOT / "daily_stock_analysis" / ".venv" / "bin" / "python"
+    if dsa_venv.exists():
+        env["DAILY_STOCK_ANALYSIS_PYTHON"] = str(dsa_venv)
+    if "TRADINGAGENTS_PYTHON" not in env:
+        env["TRADINGAGENTS_PYTHON"] = str(ROOT / ".test-venv" / "bin" / "python")
+    if "UZI_PYTHON" not in env:
+        env["UZI_PYTHON"] = env.get("PYTHON_BIN", "python")
     return env
 
 
@@ -136,6 +145,8 @@ def normalize_dsa_symbol(symbol: str) -> str:
     s = symbol.strip()
     if not s:
         return ""
+    # Remove .HK or .SZ or .SS suffixes
+    s = re.sub(r"\.(HK|SZ|SS|HK)$", "", s, flags=re.IGNORECASE)
     if re.fullmatch(r"\d{5}", s):
         return "hk" + s
     return s.upper() if not s.lower().startswith("hk") else "hk" + s[2:].zfill(5)
@@ -185,6 +196,16 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str], *, timeout: int | None =
     except OSError:
         pass
     return proc.returncode, output or ""
+
+
+def without_broken_local_proxy(env: dict[str, str]) -> dict[str, str]:
+    """Remove dead localhost proxy settings for tools that can reach LLMs directly."""
+    cleaned = dict(env)
+    for key in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = str(cleaned.get(key) or "")
+        if "127.0.0.1:7892" in value or "localhost:7892" in value:
+            cleaned.pop(key, None)
+    return cleaned
 
 
 def run_python_snippet(python_bin: str, snippet: str, cwd: Path, env: dict[str, str], *, timeout: int | None = None, name: str = "snippet") -> tuple[int, str]:
@@ -242,7 +263,7 @@ def stage_openbb_context(pool: list[dict[str, str]], env: dict[str, str]) -> dic
         write_json(OUTPUTS / "openbb_context.json", context)
         return context
 
-    run_env = dict(env)
+    run_env = prepare_node_proxy_env(env)
     run_env["PIPELINE_OPENBB_POOL"] = json.dumps(pool, ensure_ascii=False)
     timeout = int(env.get("PIPELINE_OPENBB_TIMEOUT", "900"))
     try:
@@ -312,7 +333,7 @@ def stage_kronos_context(openbb_context: dict[str, Any], env: dict[str, str]) ->
 
     payload_path = WORK / "kronos_payload.json"
     write_json(payload_path, candidates)
-    run_env = dict(env)
+    run_env = prepare_node_proxy_env(env)
     run_env.pop("PIPELINE_KRONOS_PAYLOAD", None)
     run_env["PIPELINE_KRONOS_PAYLOAD_FILE"] = str(payload_path)
     run_env["KRONOS_DIR"] = str(kronos_dir)
@@ -363,9 +384,11 @@ def stage_dexter_context(candidates: list[dict[str, Any]], env: dict[str, str]) 
         context = {"status": "unavailable", "error": "Dexter 缺少 OPENAI_API_KEY", "symbols": []}
         write_json(OUTPUTS / "dexter_context.json", context)
         return context
+    missing_financial_datasets_key = (
+        env.get("DEXTER_REQUIRE_FINANCIAL_DATASETS", "1") == "1"
+        and not env.get("FINANCIAL_DATASETS_API_KEY")
+    )
     degraded_reason = ""
-    if env.get("DEXTER_REQUIRE_FINANCIAL_DATASETS", "1") == "1" and not env.get("FINANCIAL_DATASETS_API_KEY"):
-        degraded_reason = "Dexter 缺少 FINANCIAL_DATASETS_API_KEY，已移除 get_financials 并使用共享数据/行情/文件/搜索兜底"
 
     top_n = int(env.get("DEXTER_TOP_N", "10"))
     enriched = read_json_if_exists(OUTPUTS / "enriched_stock_data.json", {})
@@ -391,8 +414,12 @@ def stage_dexter_context(candidates: list[dict[str, Any]], env: dict[str, str]) 
         write_json(OUTPUTS / "dexter_context.json", context)
         return context
 
+    shared_data_complete = all(dexter_shared_data_complete(item.get("shared_data") or {}) for item in payload)
+    if missing_financial_datasets_key and not shared_data_complete:
+        degraded_reason = "Dexter 缺少 FINANCIAL_DATASETS_API_KEY，且共享数据包财务/行情字段不完整"
+
     runner = ensure_dexter_runner(dexter_dir)
-    run_env = dict(env)
+    run_env = prepare_node_proxy_env(env)
     payload_path = WORK / "dexter_payload.json"
     write_json(payload_path, payload)
     run_env.pop("PIPELINE_DEXTER_PAYLOAD", None)
@@ -429,10 +456,33 @@ def stage_dexter_context(candidates: list[dict[str, Any]], env: dict[str, str]) 
         return context
     parsed.setdefault("status", "ok")
     if degraded_reason:
-        parsed["status"] = "degraded" if parsed.get("status") == "ok" else parsed.get("status", "degraded")
         parsed["degraded_reason"] = degraded_reason
     write_json(OUTPUTS / "dexter_context.json", parsed)
     return parsed
+
+
+def prepare_node_proxy_env(env: dict[str, str]) -> dict[str, str]:
+    run_env = dict(env)
+    outbound_proxy = run_env.get("PIPELINE_OUTBOUND_PROXY") or run_env.get("ALL_PROXY") or run_env.get("all_proxy")
+    if outbound_proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            run_env.pop(key, None)
+        run_env["ALL_PROXY"] = outbound_proxy
+        run_env["all_proxy"] = outbound_proxy
+    return run_env
+
+
+def dexter_shared_data_complete(shared_data: dict[str, Any]) -> bool:
+    enriched = shared_data.get("enriched") or {}
+    candidate = shared_data.get("candidate") or {}
+    fundamentals = enriched.get("fundamentals") or {}
+    has_price = bool(enriched.get("close") or candidate.get("close"))
+    has_market_context = bool(enriched.get("recent_klines") or enriched.get("technical"))
+    has_fundamentals = any(
+        fundamentals.get(key)
+        for key in ("pe", "pb", "market_cap_yi", "revenue_history", "net_profit_history", "roe_history", "financial_health")
+    )
+    return has_price and has_market_context and has_fundamentals
 
 
 def dexter_tool_allowlist_without_financials(value: str) -> str:
@@ -500,9 +550,23 @@ def is_us_stock_symbol(symbol: str) -> bool:
 DEXTER_BATCH_RUNNER = r'''
 import { config } from 'dotenv';
 import { readFileSync } from 'node:fs';
-import { Agent } from '../src/agent/index.js';
 
 config();
+
+async function installOutboundProxyFetch() {
+  const outboundProxy = process.env.PIPELINE_OUTBOUND_PROXY || process.env.ALL_PROXY || process.env.all_proxy;
+  if (!outboundProxy || !outboundProxy.startsWith('socks')) return;
+
+  const { SocksProxyAgent } = await import('socks-proxy-agent');
+  const dispatcher = new SocksProxyAgent(outboundProxy);
+  const nativeFetch = globalThis.fetch;
+  globalThis.fetch = (input, init = {}) => nativeFetch(input, { ...init, dispatcher });
+}
+
+await installOutboundProxyFetch();
+const { initializeOutboundProxyFetch } = await import('../src/model/llm.js');
+await initializeOutboundProxyFetch();
+const { Agent } = await import('../src/agent/index.js');
 
 const payloadText = process.env.PIPELINE_DEXTER_PAYLOAD_FILE
   ? readFileSync(process.env.PIPELINE_DEXTER_PAYLOAD_FILE, 'utf8')
@@ -539,7 +603,7 @@ async function researchOne(item) {
   const sharedData = item.shared_data ? JSON.stringify(item.shared_data).slice(0, 12000) : '{}';
   const query = `请研究美股 ${symbol} ${name}。结合可用财务、价格、公司文件和新闻资料，输出严格JSON：
 系统已经提供一份共享数据包，里面包含 daily_stock_analysis 初筛、OpenBB/enriched 行情财务、Kronos 趋势、外部/Serenity 信号、字段来源和数据质量标记。
-你必须优先读取这份共享数据包；外部工具取数失败时必须使用共享数据继续完成研究，不要因为工具失败输出空泛结论。
+你必须把这份共享数据包视为正式数据源并优先使用；外部工具只作为补充，取数失败不影响基于共享数据完成研究。data_sources_used 中不要把共享数据称为 fallback。
 共享数据如下：
 ${sharedData}
 
@@ -1040,6 +1104,9 @@ def infer_us_price_scale(ticker, latest, provider):
     forced = {x.strip().upper() for x in os.environ.get("PIPELINE_FORCE_US_PRICE_DIV10_TICKERS", "").split(",") if x.strip()}
     if normalized in forced:
         return 10
+    known_div10 = set()
+    if normalized in known_div10 and latest >= 1000:
+        return 10
     known_high_price = {
         "ASML", "AZO", "BKNG", "BLK", "BRK.A", "BRK.B", "CMG", "COST",
         "FICO", "GS", "LMT", "LLY", "MELI", "MSTR", "NVR", "REGN",
@@ -1428,6 +1495,11 @@ def stage_daily_stock_analysis(
                 "SCHEDULE_RUN_IMMEDIATELY": "false",
                 "RUN_IMMEDIATELY": "true",
             })
+            # Ensure daily_stock_analysis can import data_provider module
+            # by adding its directory to PYTHONPATH
+            dsa_real_path = str(dsa_dir.resolve())
+            existing_pythonpath = run_env.get("PYTHONPATH", "")
+            run_env["PYTHONPATH"] = f"{dsa_real_path}:{existing_pythonpath}" if existing_pythonpath else dsa_real_path
             try:
                 rc, output = run(
                     [
@@ -1458,6 +1530,12 @@ def stage_daily_stock_analysis(
 
     db_path = dsa_dir / "data" / "stock_analysis.db"
     scored = score_from_stock_daily(db_path, pool, openbb_context or {})
+
+    # Fail immediately if DSA had failures and no fallback data was retrieved
+    if not skip_dsa_fetch and not scored:
+        reason = "Daily Stock Analysis failed and no fallback data available from database"
+        print(reason)
+        raise RuntimeError(reason)
     external_signals = load_external_signals(env)
     write_json(OUTPUTS / "external_signals_loaded.json", list(external_signals.values()))
     scored = apply_external_signals(scored, external_signals)
@@ -2558,37 +2636,70 @@ def baimao_conclusion(row: dict[str, Any], score: float, rating: str, verdict: s
     )
 
 
+def public_bottleneck_action(value: Any) -> str:
+    text = str(value or "").strip()
+    mapping = {
+        "Watch Only": "只观察",
+        "watch_only": "只观察",
+        "skip": "跳过",
+        "进入主流程深度研究": "进入主流程深度研究",
+        "观察": "观察",
+        "只观察": "只观察",
+    }
+    return mapping.get(text, text or "观察")
+
+
+def public_bottleneck_validation(row: dict[str, Any]) -> str:
+    red_blocks = [x for x in (row.get("red_team") or []) if x.get("block_buy")]
+    evidence = str(row.get("evidence_level") or "弱")
+    if red_blocks:
+        return "红队阻断，暂不进入买入候选"
+    if evidence in {"强", "高"}:
+        return "可进入主流程验证；仍需价格和风控确认"
+    if evidence == "中":
+        return "可跟踪，需订单/客户/产能事实确认"
+    return "外部线索，证据偏弱，仅观察"
+
+
+def public_bottleneck_next_step(row: dict[str, Any]) -> str:
+    milestones = row.get("milestones") or []
+    if milestones:
+        first = milestones[0] or {}
+        event = str(first.get("event") or "订单/客户/产能事实验证")
+        deadline = str(first.get("deadline") or "未来2个季度内")
+        kill = str(first.get("kill_threshold") or "无一手事实则保持只观察")
+        return f"{event}｜{deadline}｜{kill}"
+    return "订单/客户/产能事实验证｜未来2个季度内｜无一手事实则保持只观察"
+
+
+def public_bottleneck_bullet(row: dict[str, Any]) -> list[str]:
+    symbol = str(row.get("symbol") or "")
+    name = str(row.get("name") or symbol)
+    title = f"{name} {symbol}" if name and name != symbol else symbol
+    return [
+        f"- {title}：{row.get('tier') or '外部线索'} / {row.get('role') or '供应链瓶颈观察'}；体系分 {row.get('serenity_score') or '-'}；动作 {public_bottleneck_action(row.get('action'))}",
+        f"  观察理由：{row.get('bottleneck') or '待确认瓶颈'}；证据 {row.get('evidence_level') or '弱'}；{public_bottleneck_validation(row)}",
+        f"  下一步：{public_bottleneck_next_step(row)}",
+    ]
+
+
 def render_serenity_bottleneck_markdown(rows: list[dict[str, Any]]) -> str:
     today = dt.date.today().isoformat()
     lines = [
-        "# 白毛/Serenity 瓶颈选股体系",
+        "# 供应链瓶颈观察清单",
         "",
         f"生成日期：{today}",
         "",
-        "口径：这是独立体系，单列候选；不参与 Top10/Buy3 正式评分。筛出的标的如果进入主流程，仍必须经过 daily_stock_analysis、TradingAgents、UZI、先验一致性、红队证伪和价位确认。",
+        "口径：这是外部线索清单，只提示潜在供应链瓶颈；不参与正式评分，不决定十大观察池，不触发三只买入候选。买入仍需初筛层、深度投研层、投委复核、量化风控复核和价位确认。",
         "",
     ]
     if not rows:
         lines += ["今日没有独立瓶颈候选。", ""]
         return "\n".join(lines).strip() + "\n"
     for idx, row in enumerate(rows, 1):
-        secondary = row.get("baimao_secondary") or {}
-        lines += [
-            f"{idx}. {row.get('name') or row['symbol']} {row['symbol']}",
-            f"体系分：{row.get('serenity_score')}；分层：{row.get('tier')}；动作：{row.get('action')}",
-            f"白毛二次分析：{secondary.get('secondary_score', '-')}；评级：{secondary.get('rating', '-')}；结论：{secondary.get('verdict', '-')}",
-            f"综合结论：{secondary.get('conclusion', '-')}",
-            f"瓶颈：{row.get('bottleneck')}；链条层级：{row.get('chain_tier')}；证据：{row.get('evidence_level')}",
-            f"供应链地图：{secondary.get('supply_chain_map', '-')}",
-            f"月度初筛：{'; '.join(row.get('monthly_screen', {}).get('criteria', [])[:6])}；拥挤度：{row.get('monthly_screen', {}).get('crowding_check')}",
-            f"季度复审：{'; '.join(row.get('quarterly_review', {}).get('checks', [])[:5])}",
-            "买前红队：" + "；".join(f"{x.get('risk')}={x.get('status')}" for x in row.get("red_team", [])[:4]),
-            "证据缺口：" + "；".join(str(x) for x in (secondary.get("contradictions_and_missing_proof") or [])[:3]),
-            "持股监控：",
-        ]
-        for m in row.get("milestones", [])[:3]:
-            lines.append(f"- {m.get('event')}｜{m.get('deadline')}｜{m.get('kill_threshold')}")
-        lines += [f"熔断/降级：{row.get('kill_criteria') or '红队证伪成立或一手事实不足'}", ""]
+        bullet = public_bottleneck_bullet(row)
+        bullet[0] = f"{idx}. " + bullet[0].lstrip("- ")
+        lines += bullet + [""]
     return "\n".join(lines).strip() + "\n"
 
 
@@ -2708,7 +2819,7 @@ def stage_vibe_trading_review(top10: list[dict[str, Any]], env: dict[str, str]) 
     def review_one(row: dict[str, Any]) -> dict[str, Any]:
         symbol = normalize_dsa_symbol(str(row.get("symbol") or ""))
         prompt = build_vibe_trading_prompt([row])
-        run_env = dict(env)
+        run_env = without_broken_local_proxy(env)
         run_env.setdefault("LANGCHAIN_PROVIDER", env.get("VIBE_TRADING_PROVIDER", "openai"))
         run_env.setdefault("LANGCHAIN_MODEL_NAME", env.get("VIBE_TRADING_MODEL", env.get("OPENAI_MODEL", "gpt-4o-mini")))
         run_env.setdefault("TIMEOUT_SECONDS", env.get("VIBE_TRADING_TOOL_TIMEOUT", "180"))
@@ -2842,6 +2953,9 @@ def apply_vibe_trading_review(rows: list[dict[str, Any]], context: dict[str, Any
                 item["buy_eligible"] = False
                 item["action"] = "观察" if str(item.get("action")) == "买入" else item.get("action", "观察")
                 item["total_score"] = round(min(safe_float(item.get("total_score")), 64.0), 2)
+                item["risk_adjusted_score"] = item["total_score"]
+                raw_total = safe_float(item.get("raw_total_score"), item["total_score"])
+                item["score_cap_reason"] = "；".join(gates) if item["total_score"] < raw_total else item.get("score_cap_reason", "")
             item["reason"] = (
                 f"{item.get('reason', '')}；Vibe-Trading复核：{stance}，"
                 f"{complete_excerpt(strip_actionable_price_sentences(str(review.get('summary', ''))), 180)}"
@@ -3100,6 +3214,8 @@ def build_enriched_stock_data(
         market = openbb_map.get(symbol) or openbb_map.get(normalize_dsa_symbol(str(candidate.get("symbol") or ""))) or {}
         existing = existing_map.get(symbol) or {}
         fundamentals = dict(existing.get("fundamentals") or {})
+        close = first_positive(market.get("close"), candidate.get("close"), fundamentals.get("price"))
+        fundamentals = anchor_fundamentals_to_market_price(fundamentals, close, market.get("provider") or candidate.get("provider"))
         should_fetch_fundamentals = (
             fetch_fundamentals
             and (fundamental_scope == "all" or symbol in candidate_map or symbol in trading_map or symbol in uzi_map)
@@ -3119,7 +3235,6 @@ def build_enriched_stock_data(
         if candidate:
             field_sources.setdefault("score", "daily_stock_analysis")
         quality = data_quality_flags(candidate, market, fundamentals, klines)
-        close = first_positive(market.get("close"), candidate.get("close"), fundamentals.get("price"))
         return {
             "symbol": symbol,
             "name": pool_item.get("name") or candidate.get("name") or fundamentals.get("name") or symbol,
@@ -3324,111 +3439,6 @@ def status_is_ok_uzi(row: dict[str, object]) -> bool:
     return not any(any(marker in flag for marker in hard_flags) for flag in flags)
 
 
-def build_flow_status(
-    *,
-    env: dict[str, str],
-    run_mode: str,
-    counts: dict[str, int],
-    trading: list[dict[str, object]],
-    uzi: list[dict[str, object]],
-    vibe_review: dict[str, object],
-    final_report_written: bool,
-    telegram_enabled: bool,
-    telegram_sent: bool | None,
-) -> dict[str, object]:
-    completed_layers: list[str] = []
-    missing_layers: list[str] = []
-    blocking_reasons: list[str] = []
-    evidence_files = [
-        "outputs/candidates_top50.json",
-        "outputs/tradingagents_top20.json",
-        "outputs/uzi_top10.json",
-        "outputs/final_top10.md",
-        "outputs/final_top10.json",
-    ]
-
-    if run_mode != "formal":
-        return {
-            "run_mode": run_mode,
-            "overall_status": "ok",
-            "completed_layers": ["smoke" if run_mode == "smoke" else "diagnostic"],
-            "missing_layers": [],
-            "blocking_reasons": [f"{run_mode} 模式只证明连线或单层诊断，不代表正式日报完成"],
-            "evidence_files": evidence_files,
-            "can_publish_buy_report": False,
-        }
-
-    if env.get("PIPELINE_SKIP_TRADINGAGENTS") == "1":
-        missing_layers.append("tradingagents")
-        blocking_reasons.append("正式日报禁止 PIPELINE_SKIP_TRADINGAGENTS=1")
-    if env.get("PIPELINE_SKIP_UZI") == "1":
-        missing_layers.append("uzi")
-        blocking_reasons.append("正式日报禁止 PIPELINE_SKIP_UZI=1")
-    if env.get("PIPELINE_TRADINGAGENTS_ALLOW_INCOMPLETE_FINAL") == "1":
-        missing_layers.append("tradingagents")
-        blocking_reasons.append("正式日报禁止 PIPELINE_TRADINGAGENTS_ALLOW_INCOMPLETE_FINAL=1")
-
-    if counts.get("screen", 0) > 0:
-        completed_layers.append("dsa")
-    else:
-        missing_layers.append("dsa")
-        blocking_reasons.append("DSA 初筛未产出候选")
-
-    bad_ta = [str(row.get("symbol") or "?") for row in trading if not status_is_full_tradingagents(row)]
-    if trading and not bad_ta:
-        completed_layers.append("tradingagents")
-    else:
-        missing_layers.append("tradingagents")
-        detail = "、".join(bad_ta[:8]) if bad_ta else "无 TradingAgents 完整版结果"
-        blocking_reasons.append(f"TradingAgents 未正式完成：{detail}")
-
-    bad_uzi = []
-    for row in uzi:
-        if not status_is_ok_uzi(row):
-            flags = "；".join(str(flag) for flag in (row.get("quality_flags") or []))
-            bad_uzi.append(f"{row.get('symbol') or '?'} {row.get('status') or 'unknown'} {flags}".strip())
-    if uzi and not bad_uzi:
-        completed_layers.append("uzi")
-    else:
-        missing_layers.append("uzi")
-        detail = "；".join(bad_uzi[:8]) if bad_uzi else "无 UZI ok 投委结果"
-        blocking_reasons.append(f"UZI 未正式完成：{detail}")
-
-    vibe_enabled = env.get("VIBE_TRADING_ENABLED", "0") == "1"
-    if vibe_enabled:
-        if str(vibe_review.get("status") or "") == "ok":
-            completed_layers.append("vibe_trading")
-        else:
-            missing_layers.append("vibe_trading")
-            blocking_reasons.append(f"Vibe-Trading 未正式完成：{vibe_review.get('status') or 'unknown'}")
-
-    if final_report_written:
-        completed_layers.append("final_report")
-    else:
-        missing_layers.append("final_report")
-        blocking_reasons.append("最终报告未生成")
-
-    if telegram_enabled:
-        if telegram_sent is True:
-            completed_layers.append("telegram")
-        else:
-            missing_layers.append("telegram")
-            blocking_reasons.append("Telegram 启用但未发送成功")
-
-    missing_layers = list(dict.fromkeys(missing_layers))
-    completed_layers = list(dict.fromkeys(layer for layer in completed_layers if layer not in missing_layers))
-    overall_status = "ok" if not missing_layers and not blocking_reasons else "failed"
-    return {
-        "run_mode": "formal",
-        "overall_status": overall_status,
-        "completed_layers": completed_layers,
-        "missing_layers": missing_layers,
-        "blocking_reasons": blocking_reasons,
-        "evidence_files": evidence_files,
-        "can_publish_buy_report": overall_status == "ok",
-    }
-
-
 def valid_volume_ratio(value: Any) -> float | None:
     try:
         if value is None:
@@ -3493,9 +3503,63 @@ def volatility(values: list[float]) -> float:
     return math.sqrt(sum((r - mean) ** 2 for r in rets) / len(rets))
 
 
+def run_tradingagents_with_timeout(
+    candidates: list[dict[str, Any]],
+    *,
+    trading_dir: str,
+    python_bin: str,
+    env: dict[str, str],
+    per_stock_timeout: int,
+    stage_timeout: int,
+    max_workers: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run TA with watchdog timeout and block formal output on timeout."""
+    import concurrent.futures
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        run_tradingagents_full_batch,
+        candidates,
+        trading_dir=trading_dir,
+        python_bin=python_bin,
+        env=env,
+        per_stock_timeout=per_stock_timeout,
+        stage_timeout=stage_timeout,
+        max_workers=max_workers,
+    )
+
+    try:
+        out, ta_meta = future.result(timeout=stage_timeout + 60)
+        print(f"[TA-WATCHDOG] Full batch completed in time", flush=True)
+        return out, ta_meta
+    except FutureTimeoutError:
+        print(f"[TA-WATCHDOG] Timeout exceeded ({stage_timeout + 60}s), blocking formal TA output", flush=True)
+        future.cancel()
+
+        failed_symbols = [c.get("symbol", "?") for c in candidates]
+        ta_meta = {
+            "ta_stage_status": "watchdog_timeout",
+            "ta_completed_full": 0,
+            "ta_failed_symbols": failed_symbols,
+            "ta_total_symbols": len(candidates),
+            "ta_failure_reason": f"watchdog timeout after {stage_timeout + 60}s",
+        }
+        return [], ta_meta
+    finally:
+        executor.shutdown(wait=False)
+
+
 def stage_tradingagents(candidates: list[dict[str, Any]], env: dict[str, str], top_n: int) -> list[dict[str, Any]]:
+    print(f"[TA] Starting TradingAgents stage with {len(candidates)} candidates, top_n={top_n}", flush=True)
     if env.get("PIPELINE_SKIP_TRADINGAGENTS") == "1":
         out = [fallback_trading(item, "skipped") for item in candidates[:top_n]]
+        write_json(OUTPUTS / "tradingagents_stage_meta.json", {
+            "ta_stage_status": "skipped",
+            "ta_completed_full": 0,
+            "ta_failed_symbols": [str(item.get("symbol") or "?") for item in candidates[:top_n]],
+            "ta_total_symbols": min(len(candidates), top_n),
+        })
         write_json(OUTPUTS / "tradingagents_top20.json", out)
         return out
 
@@ -3503,54 +3567,53 @@ def stage_tradingagents(candidates: list[dict[str, Any]], env: dict[str, str], t
     python_bin = env["TRADINGAGENTS_PYTHON"]
     if not trading_dir.exists() or not Path(python_bin).exists():
         out = [fallback_trading(item, "TradingAgents 未安装或路径不可用") for item in candidates[:top_n]]
+        write_json(OUTPUTS / "tradingagents_stage_meta.json", {
+            "ta_stage_status": "unavailable",
+            "ta_completed_full": 0,
+            "ta_failed_symbols": [str(item.get("symbol") or "?") for item in candidates[:top_n]],
+            "ta_total_symbols": min(len(candidates), top_n),
+        })
         write_json(OUTPUTS / "tradingagents_top20.json", out)
         return out
     scan_n = min(len(candidates), int(env.get("PIPELINE_TRADINGAGENTS_SCAN_N", str(max(50, top_n)))))
-    full_n = min(scan_n, max(top_n, int(env.get("PIPELINE_TRADINGAGENTS_FULL_N", str(top_n)))))
+    full_n = min(scan_n, max(1, int(env.get("PIPELINE_TRADINGAGENTS_FULL_N", str(top_n)))))
     timeout = int(env.get("PIPELINE_TRADINGAGENTS_FULL_TIMEOUT_PER_STOCK", env.get("PIPELINE_TRADINGAGENTS_TIMEOUT_PER_STOCK", "900")))
     workers = max(1, int(env.get("PIPELINE_TRADINGAGENTS_WORKERS", "2")))
-    quick_rows = [quick_trading_research(item) for item in candidates[:scan_n]]
+
+    # Parallelize quick_trading_research to speed up screening
+    print(f"[TA] Screening {scan_n} candidates with quick research...", flush=True)
+    quick_rows = []
+    with ThreadPoolExecutor(max_workers=min(workers, 4)) as executor:
+        futures = [executor.submit(quick_trading_research, item) for item in candidates[:scan_n]]
+        for i, future in enumerate(futures, 1):
+            try:
+                result = future.result(timeout=60)
+                quick_rows.append(result)
+                if i % 5 == 0:
+                    print(f"[TA] Screened {i}/{scan_n} candidates", flush=True)
+            except Exception as e:
+                print(f"[TA] Screening error for candidate {i}: {e}", flush=True)
+                quick_rows.append(quick_trading_research(candidates[i-1]))
+    print(f"[TA] Screening complete: {len(quick_rows)} results", flush=True)
+
     quick_ranked = sorted(quick_rows, key=lambda x: trading_rank_score(x), reverse=True)
     write_json(OUTPUTS / "tradingagents_quick_top50.json", quick_ranked[:scan_n])
 
     candidate_map = {item["symbol"]: item for item in candidates}
     scan_items = [candidate_map[row["symbol"]] for row in quick_ranked[:full_n] if row["symbol"] in candidate_map]
 
-    def analyze(item: dict[str, Any]) -> dict[str, Any]:
-        symbol = to_tradingagents_symbol(item["symbol"])
-        run_env = dict(env)
-        run_env["PIPELINE_TA_TICKER"] = symbol
-        run_env["PIPELINE_TA_DATE"] = env.get("PIPELINE_TA_DATE") or dt.date.today().isoformat()
-        try:
-            rc, text = run([python_bin, "-c", TRADINGAGENTS_SNIPPET], trading_dir, run_env, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return quick_trading_research(item, note=f"完整版超时 {timeout}s")
-        write_text(WORK / f"tradingagents_{safe_name(symbol)}.log", text)
-        parsed = parse_last_json(text)
-        if rc != 0 or not parsed:
-            return quick_trading_research(item, note=summarize_failure(text, rc))
-        return normalize_trading_result(item, parsed, text)
-
-    out: list[dict[str, Any]] = []
-    stop_note: str | None = None
-    FATAL = {"额度不足", "权限或额度不足", "认证失败"}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {executor.submit(analyze, item): item for item in scan_items}
-        for future in as_completed(future_map):
-            result = future.result()
-            out.append(result)
-            note = str(result.get("ta_note", ""))
-            if note in FATAL:
-                stop_note = note
-                break
-
-    if stop_note and len(out) < top_n:
-        completed = {row.get("symbol") for row in out}
-        for item in scan_items:
-            if len(out) >= top_n:
-                break
-            if item.get("symbol") not in completed:
-                out.append(quick_trading_research(item, note=stop_note))
+    ta_full_timeout = int(env.get("PIPELINE_TRADINGAGENTS_STAGE_TIMEOUT", "3600"))
+    print(f"[TA] Running {len(scan_items)} full analyses with {ta_full_timeout}s stage timeout", flush=True)
+    out, ta_meta = run_tradingagents_with_timeout(
+        scan_items,
+        trading_dir=str(trading_dir),
+        python_bin=python_bin,
+        env=env,
+        per_stock_timeout=timeout,
+        stage_timeout=ta_full_timeout,
+        max_workers=workers,
+    )
+    write_json(OUTPUTS / "tradingagents_stage_meta.json", ta_meta)
 
     allow_incomplete = env.get("PIPELINE_TRADINGAGENTS_ALLOW_INCOMPLETE_FINAL", "0") == "1"
     if allow_incomplete and len(out) < top_n:
@@ -3564,7 +3627,7 @@ def stage_tradingagents(candidates: list[dict[str, Any]], env: dict[str, str], t
                 completed.add(symbol)
 
     full_rows = [row for row in out if row.get("ta_status") == "full"]
-    ranked_source = full_rows if not allow_incomplete else out
+    ranked_source = out if allow_incomplete else full_rows
     ranked = sorted(ranked_source, key=lambda x: trading_rank_score(x), reverse=True)[:top_n]
     write_json(OUTPUTS / "tradingagents_full_top20.json", out)
     write_json(OUTPUTS / "tradingagents_top20.json", ranked)
@@ -3613,6 +3676,23 @@ def quick_trading_research(item: dict[str, Any], note: str = "") -> dict[str, An
     }
 
 
+def failed_tradingagents_result(item: dict[str, Any], note: str, error_type: str) -> dict[str, Any]:
+    score = safe_float(item.get("score"))
+    return {
+        "symbol": item["symbol"],
+        "ta_symbol": to_tradingagents_symbol(item["symbol"]),
+        "name": item.get("name", ""),
+        "dsa_score": score,
+        "action": "WATCH",
+        "confidence": 0.0,
+        "risk": "high",
+        "reason": f"TradingAgents 完整版未完成：{translate_failure_note(note)}",
+        "ta_status": "failed",
+        "ta_note": note,
+        "ta_error_type": error_type,
+    }
+
+
 def trading_rank_score(row: dict[str, Any]) -> float:
     risk_penalty = {"low": 0, "medium": 3, "high": 10, "低": 0, "中": 3, "高": 10}.get(str(row.get("risk", "medium")), 3)
     action_bonus = {"BUY": 6, "HOLD": 2, "WATCH": 0, "SELL": -20}.get(str(row.get("action", "")).upper(), 0)
@@ -3655,6 +3735,7 @@ config["llm_provider"] = os.environ.get("TRADINGAGENTS_LLM_PROVIDER", config.get
 config["backend_url"] = os.environ.get("TRADINGAGENTS_LLM_BACKEND_URL") or os.environ.get("OPENAI_BASE_URL") or config.get("backend_url")
 config["deep_think_llm"] = os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM") or config.get("deep_think_llm", "gpt-4o")
 config["quick_think_llm"] = os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or config.get("quick_think_llm", "gpt-4o-mini")
+config["resolve_memory_outcomes"] = os.environ.get("TRADINGAGENTS_RESOLVE_MEMORY_OUTCOMES", "0").strip().lower() in ("1", "true", "yes", "on")
 config["max_recur_limit"] = int(os.environ.get("PIPELINE_TRADINGAGENTS_RECURSION_LIMIT", config.get("max_recur_limit", 100)))
 config["data_vendors"] = {
     "core_stock_apis": os.environ.get("TRADINGAGENTS_CORE_DATA_VENDOR", "pipeline,yfinance,alpha_vantage"),
@@ -3662,8 +3743,18 @@ config["data_vendors"] = {
     "fundamental_data": os.environ.get("TRADINGAGENTS_FUND_DATA_VENDOR", "pipeline,yfinance,alpha_vantage"),
     "news_data": os.environ.get("TRADINGAGENTS_NEWS_DATA_VENDOR", "pipeline,yfinance,alpha_vantage"),
 }
+print(f"[TA-DEBUG] Config ready. Backend: {config.get('backend_url')}", flush=True)
+print(f"[TA-DEBUG] Initializing TradingAgentsGraph...", flush=True)
+import time
+t0 = time.time()
 graph = TradingAgentsGraph(debug=False, config=config)
-final_state, decision = graph.propagate(os.environ["PIPELINE_TA_TICKER"], os.environ["PIPELINE_TA_DATE"])
+print(f"[TA-DEBUG] TradingAgentsGraph initialized in {time.time()-t0:.1f}s", flush=True)
+ticker = os.environ["PIPELINE_TA_TICKER"]
+date = os.environ["PIPELINE_TA_DATE"]
+print(f"[TA-DEBUG] Starting propagate({ticker}, {date})...", flush=True)
+t1 = time.time()
+final_state, decision = graph.propagate(ticker, date)
+print(f"[TA-DEBUG] propagate() completed in {time.time()-t1:.1f}s", flush=True)
 payload = {
     "action": decision,
     "decision": decision,
@@ -3819,12 +3910,6 @@ def summarize_failure(text: str, rc: int) -> str:
         return "额度不足"
     if "PermissionDeniedError" in body or "403" in body:
         return "权限或额度不足"
-    body_lower = body.lower()
-    if any(kw in body_lower for kw in [
-        "authenticationerror", "401", "invalid_api_key",
-        "api key 无效", "invalid api key"
-    ]):
-        return "认证失败"
     if "timeout" in body.lower():
         return "超时"
     if "YFRateLimitError" in body or "Too Many Requests" in body or "Alpha Vantage rate limit" in body:
@@ -3858,7 +3943,7 @@ def stage_uzi(trading: list[dict[str, Any]], env: dict[str, str], top_n: int) ->
         cached = read_uzi_cache(uzi_dir, symbol)
         if cached and uzi_cache_reusable(cached, cache_max_age_hours, item, symbol, env):
             cached = ensure_uzi_agent_review(item, symbol, cached, uzi_dir, python_bin, env)
-            cached_row = normalize_uzi_result(item, symbol, cached)
+            cached_row = normalize_uzi_result(item, symbol, cached, uzi_dir, env)
             if str(cached_row.get("status")) != "degraded" or env.get("PIPELINE_UZI_RERUN_DEGRADED_CACHE", "1") == "0":
                 out.append(cached_row)
                 consecutive_failures = 0
@@ -3887,7 +3972,7 @@ def stage_uzi(trading: list[dict[str, Any]], env: dict[str, str], top_n: int) ->
                 break
             continue
         parsed = ensure_uzi_agent_review(item, symbol, parsed, uzi_dir, python_bin, env)
-        out.append(normalize_uzi_result(item, symbol, parsed))
+        out.append(normalize_uzi_result(item, symbol, parsed, uzi_dir, env))
         consecutive_failures = 0
 
     out = annotate_uzi_batch_quality(out, env)
@@ -3970,6 +4055,70 @@ def seed_uzi_cache_from_pipeline(selected: list[dict[str, Any]], uzi_dir: Path, 
     return {"status": "ok", "seeded": seeded, "count": len(seeded)}
 
 
+def build_uzi_seed_raw_for_item(item: dict[str, Any], uzi_dir: Path, env: dict[str, str]) -> dict[str, Any]:
+    openbb_context = read_json_if_exists(OUTPUTS / "openbb_context.json", {})
+    enriched_context = read_json_if_exists(OUTPUTS / "enriched_stock_data.json", {})
+    candidates = read_json_if_exists(OUTPUTS / "candidates_top50.json", [])
+    symbol = str(item.get("symbol") or "")
+    uzi_symbol = to_uzi_symbol(symbol)
+    candidate_map = {str(row.get("symbol")): row for row in candidates if isinstance(row, dict)}
+    openbb_map = build_openbb_symbol_map(openbb_context if isinstance(openbb_context, dict) else {})
+    enriched_map = build_enriched_symbol_map(enriched_context if isinstance(enriched_context, dict) else {})
+    dsa_item = candidate_map.get(symbol, {})
+    market_row = (
+        enriched_map.get(symbol)
+        or enriched_map.get(normalize_dsa_symbol(symbol))
+        or openbb_map.get(symbol)
+        or openbb_map.get(normalize_dsa_symbol(symbol))
+        or {}
+    )
+    fundamentals = dict((market_row.get("fundamentals") or {}) if isinstance(market_row, dict) else {})
+    fundamentals = complete_pipeline_fundamentals(symbol, fundamentals, env)
+    return build_uzi_seed_raw(symbol, uzi_symbol, item, dsa_item, market_row, fundamentals)
+
+
+def restore_pipeline_seed_dimensions(parsed: dict[str, Any], item: dict[str, Any], uzi_dir: Path, env: dict[str, str]) -> dict[str, Any]:
+    """Merge formal pipeline seed fields back after UZI fetchers overwrite HK basic data."""
+    raw = parsed.get("raw") or {}
+    dims = raw.get("dimensions") or {}
+    seed_raw = build_uzi_seed_raw_for_item(item, uzi_dir, env)
+    seed_dims = seed_raw.get("dimensions") or {}
+    changed = False
+
+    for dim_name in ("0_basic", "1_financials", "2_kline", "6_research", "10_valuation"):
+        seed_dim = seed_dims.get(dim_name)
+        if not isinstance(seed_dim, dict):
+            continue
+        current_dim = dims.get(dim_name)
+        if not isinstance(current_dim, dict):
+            dims[dim_name] = seed_dim
+            changed = True
+            continue
+        current_data = current_dim.get("data") if isinstance(current_dim.get("data"), dict) else {}
+        seed_data = seed_dim.get("data") if isinstance(seed_dim.get("data"), dict) else {}
+        if dim_name == "0_basic":
+            for key in ("name", "industry", "price", "market_cap", "market_cap_raw", "pe_ttm", "pb"):
+                if not current_data.get(key) and seed_data.get(key):
+                    current_data[key] = seed_data[key]
+                    changed = True
+        elif dim_name == "10_valuation":
+            for key, value in seed_data.items():
+                if not current_data.get(key) and value:
+                    current_data[key] = value
+                    changed = True
+        current_dim["data"] = current_data
+        if current_dim.get("source") != "pipeline_seed" and seed_dim.get("source"):
+            current_dim["pipeline_seed_source"] = seed_dim.get("source")
+        dims[dim_name] = current_dim
+
+    if changed:
+        raw["dimensions"] = dims
+        raw["pipeline_seed_restored"] = True
+        parsed = dict(parsed)
+        parsed["raw"] = raw
+    return parsed
+
+
 def read_json_if_exists(path: Path, default: Any) -> Any:
     try:
         if path.exists():
@@ -4015,6 +4164,15 @@ def build_uzi_seed_raw(
     market_cap_raw = first_positive(fundamentals.get("market_cap_raw"), market_row.get("market_cap_raw"))
     if not market_cap and market_cap_raw:
         market_cap = market_cap_raw / 1e8
+    eps = first_positive(fundamentals.get("eps"))
+    if not pe and close and eps:
+        pe = round(close / eps, 4)
+        fundamentals = dict(fundamentals)
+        fundamentals["pe"] = pe
+        fundamentals["pe_derived_from_price_eps"] = True
+        field_sources = dict(fundamentals.get("_field_sources") or {})
+        field_sources["pe"] = "pipeline_derived_price_eps"
+        fundamentals["_field_sources"] = field_sources
     field_sources = fundamentals.get("_field_sources") or {}
 
     dims["0_basic"] = {
@@ -4031,7 +4189,7 @@ def build_uzi_seed_raw(
             "market_cap_raw": market_cap_raw,
             "pe_ttm": pe,
             "pb": pb,
-            "eps": fundamentals.get("eps") or 0,
+            "eps": eps or 0,
             "dividend_yield_ttm": fundamentals.get("dividend_yield") or 0,
             "security_type": "stock",
             "field_sources": field_sources,
@@ -4187,7 +4345,11 @@ def build_uzi_valuation_dim(pe: float, pb: float, market_cap: float, fundamental
     out = {
         "pe": pe,
         "pb": pb,
-        "pe_quantile": f"5年 {pe_quantile} 分位" if pe else "PE 不适用",
+        "pe_quantile": (
+            "由 price/EPS 推导，需后续以正式估值源校验"
+            if fundamentals.get("pe_derived_from_price_eps")
+            else f"5年 {pe_quantile} 分位" if pe else "PE 不适用"
+        ),
         "industry_pe": 0,
         "dcf": f"{market_cap:.2f} 亿" if market_cap else "",
         "market_cap_yi": market_cap,
@@ -4200,9 +4362,153 @@ def build_uzi_valuation_dim(pe: float, pb: float, market_cap: float, fundamental
         out["price_to_sales"] = round(market_cap / revenue[-1], 2) if revenue[-1] else 0
     if revenue and profit and revenue[-1]:
         out["net_margin"] = round(profit[-1] / revenue[-1] * 100, 2)
+    if fundamentals.get("pe_derived_from_price_eps"):
+        out["valuation_note"] = "PE 由 pipeline 已有现价与 EPS 推导；市值/PB 若数据源未返回总股本或每股净资产，暂不硬填。"
     if revenue and not pe and any(x < 0 for x in profit[-3:]):
         out["valuation_note"] = "公司仍处亏损或利润不稳定，PE 不适用；UZI 应改用收入增长、亏损收窄、现金流和 P/S 评估。"
     return out
+
+
+def import_akshare_module() -> Any:
+    try:
+        import akshare as ak  # type: ignore
+    except Exception:
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = ROOT / ".akshare-venv" / "lib" / version / "site-packages"
+        if site_packages.exists() and str(site_packages) not in sys.path:
+            sys.path.insert(0, str(site_packages))
+        try:
+            import akshare as ak  # type: ignore
+        except Exception:
+            return None
+    return ak
+
+
+def is_hk_symbol(symbol: str) -> bool:
+    return normalize_dsa_symbol(symbol).lower().startswith("hk")
+
+
+def hk_symbol_digits(symbol: str) -> str:
+    s = normalize_dsa_symbol(symbol)
+    return s[2:].zfill(5) if s.lower().startswith("hk") else s.zfill(5)
+
+
+def parse_chinese_number(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return safe_float(value)
+    text = str(value or "").strip().replace(",", "")
+    if not text or text in {"-", "--", "None", "nan"}:
+        return 0.0
+    multiplier = 1.0
+    if "万亿" in text:
+        multiplier = 1e12
+    elif "亿" in text:
+        multiplier = 1e8
+    elif "万" in text:
+        multiplier = 1e4
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    return safe_float(match.group(0)) * multiplier if match else 0.0
+
+
+def latest_akshare_number(rows: Any, field_names: tuple[str, ...] = ()) -> float:
+    records: list[dict[str, Any]] = []
+    if hasattr(rows, "empty") and hasattr(rows, "to_dict"):
+        if getattr(rows, "empty", True):
+            return 0.0
+        records = rows.to_dict("records")
+    elif isinstance(rows, list):
+        records = [row for row in rows if isinstance(row, dict)]
+    elif isinstance(rows, dict):
+        records = [rows]
+    if not records:
+        return 0.0
+    for row in reversed(records):
+        keys = field_names or tuple(str(k) for k in row.keys())
+        for key in keys:
+            if key in row:
+                value = parse_chinese_number(row.get(key))
+                if value:
+                    return value
+        if not field_names:
+            for value in row.values():
+                parsed = parse_chinese_number(value)
+                if parsed:
+                    return parsed
+    return 0.0
+
+
+def normalize_market_cap_raw(value: float) -> float:
+    value = safe_float(value)
+    if value <= 0:
+        return 0.0
+    return value * 1e8 if value < 1e7 else value
+
+
+def akshare_call_indicator(fn: Any, symbol: str, indicator: str) -> Any:
+    try:
+        params = inspect.signature(fn).parameters
+    except Exception:
+        params = {}
+    if "indicator" in params:
+        kwargs = {"symbol": symbol, "indicator": indicator}
+        if "period" in params:
+            kwargs["period"] = "近一年"
+        return fn(**kwargs)
+    return fn(symbol=symbol)
+
+
+def fetch_akshare_hk_valuation(symbol: str) -> dict[str, Any]:
+    if not is_hk_symbol(symbol):
+        return {}
+    ak = import_akshare_module()
+    if ak is None:
+        return {}
+    code = hk_symbol_digits(symbol)
+    source = "AKShareHKValuation"
+    out: dict[str, Any] = {"source": source}
+
+    eniu = getattr(ak, "stock_hk_eniu_indicator", None)
+    if eniu:
+        for indicator, target_key, fields in (
+            ("市盈率", "pe", ("市盈率", "PE", "pe", "value")),
+            ("市净率", "pb", ("市净率", "PB", "pb", "value")),
+            ("市值", "market_cap_raw", ("总市值", "市值", "market_cap", "value")),
+        ):
+            try:
+                rows = akshare_call_indicator(eniu, code, indicator)
+            except Exception:
+                rows = None
+            value = latest_akshare_number(rows, fields)
+            if value:
+                out[target_key] = normalize_market_cap_raw(value) if target_key == "market_cap_raw" else value
+
+    baidu = getattr(ak, "stock_hk_valuation_baidu", None)
+    if baidu:
+        for indicator, target_key, fields in (
+            ("总市值", "market_cap_raw", ("总市值", "市值", "value")),
+            ("市盈率", "pe", ("市盈率", "PE", "value")),
+            ("市净率", "pb", ("市净率", "PB", "value")),
+        ):
+            if first_positive(out.get(target_key)):
+                continue
+            try:
+                rows = akshare_call_indicator(baidu, code, indicator)
+            except Exception:
+                rows = None
+            value = latest_akshare_number(rows, fields)
+            if value:
+                out[target_key] = normalize_market_cap_raw(value) if target_key == "market_cap_raw" else value
+
+    market_cap_raw = first_positive(out.get("market_cap_raw"))
+    if market_cap_raw:
+        out["market_cap_raw"] = market_cap_raw
+        out["market_cap_yi"] = round(market_cap_raw / 1e8, 4)
+    out["_field_sources"] = {
+        key: source
+        for key in ("market_cap_raw", "market_cap_yi", "pe", "pb")
+        if first_positive(out.get(key))
+    }
+    return out if fundamental_payload_has_signal(out) else {}
 
 
 def fetch_pipeline_fundamentals(symbol: str, env: dict[str, str]) -> dict[str, Any]:
@@ -4210,14 +4516,14 @@ def fetch_pipeline_fundamentals(symbol: str, env: dict[str, str]) -> dict[str, A
         return {}
     merged: dict[str, Any] = {}
     sources: list[str] = []
-    for fetcher in (
-        fetch_fmp_fundamentals,
-        fetch_alpha_overview,
-        fetch_yahoo_fundamentals,
-        fetch_eastmoney_fundamentals,
-        fetch_sec_fundamentals,
+    for cache_key, fetcher in (
+        ("fmp", fetch_fmp_fundamentals),
+        ("alpha_overview", fetch_alpha_overview),
+        ("yahoo", fetch_yahoo_fundamentals),
+        ("eastmoney", fetch_eastmoney_fundamentals),
+        ("sec", fetch_sec_fundamentals),
     ):
-        data = cached_fundamental_fetch(getattr(fetcher, "__name__", "fetcher"), symbol, lambda fetcher=fetcher: fetcher(symbol, env))
+        data = cached_fundamental_fetch(cache_key, symbol, lambda fetcher=fetcher: fetcher(symbol, env))
         if not data:
             continue
         merge_fundamental_payload(merged, data)
@@ -4229,6 +4535,13 @@ def fetch_pipeline_fundamentals(symbol: str, env: dict[str, str]) -> dict[str, A
         if valuation:
             merge_fundamental_payload(merged, valuation)
             source_name = str(valuation.get("source") or "MarketDataValuation").strip()
+            if source_name:
+                sources.append(source_name)
+    if is_hk_symbol(symbol) and fundamentals_need_completion(merged):
+        valuation = cached_fundamental_fetch("akshare_hk_valuation", symbol, lambda: fetch_akshare_hk_valuation(symbol))
+        if valuation:
+            merge_fundamental_payload(merged, valuation)
+            source_name = str(valuation.get("source") or "AKShareHKValuation").strip()
             if source_name:
                 sources.append(source_name)
     if env.get("PIPELINE_UZI_QUOTE_FALLBACK", "1") == "1":
@@ -4260,10 +4573,42 @@ def complete_pipeline_fundamentals(symbol: str, existing: dict[str, Any] | None,
     return current
 
 
+def anchor_fundamentals_to_market_price(fundamentals: dict[str, Any], market_price: Any, source: Any = "market") -> dict[str, Any]:
+    price = first_positive(market_price)
+    if not price:
+        return fundamentals
+    current = dict(fundamentals or {})
+    old_price = first_positive(current.get("price"))
+    if old_price and (price / old_price >= 8 or old_price / price >= 8):
+        for key in ("market_cap_raw", "market_cap_yi", "pe", "price_to_sales"):
+            current.pop(key, None)
+    current["price"] = price
+    field_sources = dict(current.get("_field_sources") or {})
+    field_sources["price"] = str(source or "market")
+    current["_field_sources"] = field_sources
+    shares = first_positive(current.get("shares_outstanding"))
+    eps = first_positive(current.get("eps"))
+    if shares and not first_positive(current.get("market_cap_raw")):
+        market_cap_raw = price * shares
+        current["market_cap_raw"] = market_cap_raw
+        current["market_cap_yi"] = market_cap_raw / 1e8
+        field_sources["market_cap_raw"] = "pipeline_derived_price_shares"
+        field_sources["market_cap_yi"] = "pipeline_derived_price_shares"
+    if eps and not first_positive(current.get("pe")):
+        current["pe"] = price / eps
+        current["pe_derived_from_price_eps"] = True
+        field_sources["pe"] = "pipeline_derived_price_eps"
+    return current
+
+
 def fundamentals_need_completion(data: dict[str, Any]) -> bool:
     if not data:
         return True
     if fundamentals_need_valuation(data):
+        return True
+    if not first_positive(data.get("pb")):
+        return True
+    if not first_positive(data.get("market_cap_raw"), data.get("market_cap_yi")):
         return True
     if not (data.get("revenue_history") or data.get("net_profit_history") or data.get("roe_history")):
         return True
@@ -4671,6 +5016,9 @@ def infer_quote_price_scale(ticker: str, latest: float) -> int:
     forced = {x.strip().upper() for x in os.environ.get("PIPELINE_FORCE_US_PRICE_DIV10_TICKERS", "").split(",") if x.strip()}
     if normalized in forced:
         return 10
+    known_div10 = set()
+    if normalized in known_div10 and latest >= 1000:
+        return 10
     known_high_price = {"ASML", "BKNG", "BRK.A", "BRK.B", "COST", "FICO", "GS", "LLY", "MELI", "MSTR", "NVR", "REGN"}
     if normalized in known_high_price:
         return 1
@@ -5061,6 +5409,80 @@ def derive_roe_from_sec(us_gaap: dict[str, Any]) -> list[float]:
     return out
 
 
+def global_hk_quote_tencent(code: str) -> dict[str, Any]:
+    req = urllib.request.Request(f"https://qt.gtimg.cn/q=r_hk{code}", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        text = response.read().decode("gb18030", errors="replace")
+    match = re.search(r'"(.+)"', text)
+    if not match:
+        raise RuntimeError("腾讯港股行情解析失败")
+    fields = match.group(1).split("~")
+    if len(fields) < 40:
+        raise RuntimeError("腾讯港股字段不足")
+    return {
+        "close": safe_float(fields[3]),
+        "open": safe_float(fields[5]),
+        "high": safe_float(fields[33]),
+        "low": safe_float(fields[34]),
+        "volume": safe_float(fields[6]),
+        "change_pct": safe_float(fields[32]),
+        "name": fields[1],
+        "provider": "global/tencent",
+    }
+
+
+def global_hk_quote_sina(code: str) -> dict[str, Any]:
+    req = urllib.request.Request(
+        f"https://hq.sinajs.cn/list=rt_hk{code}",
+        headers={"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as response:
+        text = response.read().decode("gb18030", errors="replace")
+    match = re.search(r'"(.+)"', text)
+    if not match:
+        raise RuntimeError("新浪港股行情解析失败")
+    fields = match.group(1).split(",")
+    if len(fields) < 13:
+        raise RuntimeError("新浪港股字段不足")
+    return {
+        "close": safe_float(fields[6]),
+        "open": safe_float(fields[2]),
+        "high": safe_float(fields[4]),
+        "low": safe_float(fields[5]),
+        "volume": safe_float(fields[12]),
+        "change_pct": safe_float(fields[8]),
+        "name": fields[1],
+        "provider": "global/sina",
+    }
+
+
+def global_eastmoney_quote(code: str, prefix: int) -> dict[str, Any]:
+    result = http_json(
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        {"secid": f"{prefix}.{code}", "fields": "f43,f44,f45,f46,f47,f48,f55,f57,f58,f59,f60,f170"},
+        timeout=8,
+    )
+    data = result.get("data") if isinstance(result, dict) else None
+    if not data:
+        raise RuntimeError("东财 push2 无数据")
+    divisor = 10 ** int(data.get("f59") or 3)
+
+    def price(key: str) -> float:
+        value = data.get(key)
+        return 0.0 if value is None or value == "-" else safe_float(value) / divisor
+
+    return {
+        "close": price("f43"),
+        "open": price("f46"),
+        "high": price("f44"),
+        "low": price("f45"),
+        "volume": safe_float(data.get("f47")),
+        "change_pct": safe_float(data.get("f170")) / 100,
+        "name": data.get("f58") or "",
+        "provider": "global/eastmoney",
+    }
+
+
 def fetch_quote_fallback_fundamentals(symbol: str) -> dict[str, Any]:
     s = normalize_dsa_symbol(symbol)
     try:
@@ -5149,7 +5571,15 @@ def cache_is_fresh(parsed: dict[str, Any], max_age_hours: float) -> bool:
     return (time.time() - mtime) <= max_age_hours * 3600
 
 
-def normalize_uzi_result(item: dict[str, Any], symbol: str, parsed: dict[str, Any]) -> dict[str, Any]:
+def normalize_uzi_result(
+    item: dict[str, Any],
+    symbol: str,
+    parsed: dict[str, Any],
+    uzi_dir: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if uzi_dir is not None and env is not None:
+        parsed = restore_pipeline_seed_dimensions(parsed, item, uzi_dir, env)
     syn = parsed.get("synthesis") or {}
     panel = parsed.get("panel") or {}
     score = safe_float(syn.get("overall_score"), safe_float(item.get("confidence")) * 100)
@@ -5353,7 +5783,21 @@ def uzi_seed_data_quality_flags(raw: dict[str, Any]) -> list[str]:
         flags.append("UZI 财务维度不足")
     if not (kline.get("candles_60d") or kline.get("stage")):
         flags.append("UZI K线维度不足")
-    if not any(first_positive(valuation.get(key), basic.get(key)) for key in ("pe", "pe_ttm", "pb", "market_cap")):
+    valuation_has_signal = any(first_positive(valuation.get(key), basic.get(key)) for key in (
+        "pe",
+        "pe_ttm",
+        "pb",
+        "market_cap",
+        "market_cap_yi",
+        "target_price_avg",
+        "forward_pe",
+        "price_to_sales",
+        "ev_to_sales",
+        "net_margin",
+    ))
+    valuation_has_signal = valuation_has_signal or bool(valuation.get("valuation_note"))
+    valuation_has_signal = valuation_has_signal or bool(financials.get("revenue_history") or financials.get("net_profit_history"))
+    if not valuation_has_signal:
         flags.append("UZI 估值维度不足")
     return flags
 
@@ -5456,7 +5900,7 @@ def recheck_degraded_uzi_rows(
             retry["status"] = "degraded"
             out.append(retry)
             continue
-        retry = normalize_uzi_result(source_item, symbol, parsed)
+        retry = normalize_uzi_result(source_item, symbol, parsed, uzi_dir, env)
         if uzi_needs_recheck(retry):
             retry_flags = list(retry.get("quality_flags") or [])
             retry_flags.extend([str(x) for x in (row.get("quality_flags") or [])])
@@ -5534,7 +5978,8 @@ def merge_scores(candidates: list[dict[str, Any]], trading: list[dict[str, Any]]
         pretrade_audit = pretrade_consistency_audit(dsa_item, dsa_item, ta_item)
         gates = list(pretrade_audit.get("gates") or [])
         gates.extend(gate for gate in evaluate_buy_gates(dsa_item, ta_item, gate_uzi_item) if gate not in gates)
-        total = dsa_score * 0.30 + ta_score * 0.40 + uzi_score * 0.30
+        raw_total = dsa_score * 0.30 + ta_score * 0.40 + uzi_score * 0.30
+        total = raw_total
         if gates:
             hard_cap = 82.0
             if any(gate in gates for gate in ("UZI 投委未完成", "UZI 投委分低于 60")):
@@ -5560,6 +6005,7 @@ def merge_scores(candidates: list[dict[str, Any]], trading: list[dict[str, Any]]
             total = min(total, 49.0)
             if action == "买入":
                 action = "观察"
+        score_cap_reason = "；".join(gates) if total < raw_total else ""
         bucket = classify_trade_bucket(total, action, normalize_risk(ta_item.get("risk", "medium")), gates, advice)
         if bucket["bucket"] == "D" and has_hard_no_buy_gate(gates):
             advice = force_watch_only_advice(advice, gates)
@@ -5567,7 +6013,10 @@ def merge_scores(candidates: list[dict[str, Any]], trading: list[dict[str, Any]]
         row = {
             "symbol": symbol,
             "name": uzi_item.get("name") or dsa_item.get("name") or ta_item.get("name", ""),
+            "raw_total_score": round(raw_total, 2),
+            "risk_adjusted_score": round(total, 2),
             "total_score": round(total, 2),
+            "score_cap_reason": score_cap_reason,
             "dsa_score": round(dsa_score, 2),
             "tradingagents_score": round(ta_score, 2),
             "uzi_score": round(uzi_score, 2),
@@ -5664,6 +6113,7 @@ EXECUTION_PRICE_KEYS = {
     "take_profit_2",
     "buy_advice",
     "sell_advice",
+    "position_advice",
     "trade_trigger",
     "pretrade_audit",
     "quality_gates",
@@ -5687,7 +6137,7 @@ def sanitize_report_free_text(value: Any, key: str = "") -> Any:
     if isinstance(value, list):
         return [sanitize_report_free_text(v, key) for v in value]
     if isinstance(value, str) and key not in EXECUTION_PRICE_KEYS:
-        return strip_actionable_price_sentences(value)
+        return strip_actionable_price_sentences(strip_internal_error_sentences(value))
     return value
 
 
@@ -5743,13 +6193,13 @@ def compose_report_reason(row: dict[str, Any]) -> str:
         )
     dexter = row.get("dexter_signal") or {}
     if dexter:
-        summary = strip_actionable_price_sentences(str(dexter.get("summary") or ""))
+        summary = strip_actionable_price_sentences(strip_internal_error_sentences(str(dexter.get("summary") or "")))
         parts.append(
             f"Dexter：{dexter.get('stance') or '-'}，置信度 {safe_float(dexter.get('confidence')):.2f}"
             f"{'；' + complete_excerpt(summary, 180) if summary else ''}。"
         )
     if row.get("tradingagents_score") or row.get("action"):
-        ta_summary = strip_actionable_price_sentences(str(row.get("tradingagents_reason") or ""))
+        ta_summary = strip_actionable_price_sentences(strip_internal_error_sentences(str(row.get("tradingagents_reason") or "")))
         parts.append(
             f"TradingAgents：{row.get('action') or '观察'}，"
             f"置信分 {safe_float(row.get('tradingagents_score')):.1f}，"
@@ -5757,7 +6207,7 @@ def compose_report_reason(row: dict[str, Any]) -> str:
             f"{'；摘要 ' + complete_excerpt(ta_summary, 260) if ta_summary else ''}。"
         )
     if row.get("uzi_score") or row.get("rating"):
-        uzi_summary = strip_actionable_price_sentences(str(row.get("uzi_reason") or ""))
+        uzi_summary = strip_actionable_price_sentences(strip_internal_error_sentences(str(row.get("uzi_reason") or "")))
         parts.append(
             f"UZI：{safe_float(row.get('uzi_score')):.1f} 分，评级 {row.get('rating') or '-'}。"
             f"{' 投委摘要：' + complete_excerpt(uzi_summary, 260) if uzi_summary else ''}"
@@ -5831,14 +6281,14 @@ def has_hard_no_buy_gate(gates: list[str]) -> bool:
 
 
 def is_tradingagents_gate(gate: str) -> bool:
-    return str(gate).startswith("TradingAgents ")
+    return str(gate).startswith(("TradingAgents ", "深度投研层 "))
 
 
 def force_watch_only_advice(advice: dict[str, str], gates: list[str]) -> dict[str, str]:
     item = dict(advice)
     item["trade_advice"] = "只观察，不建议新开仓；等待硬性闸门解除后再评估"
     item["buy_advice"] = f"不买入；最终参考价位仍保留用于监控，原因：{'；'.join(gates[:4])}"
-    item["position_advice"] = "建议 0% 新仓；已有仓位按原计划风控"
+    item["position_advice"] = "空仓不买，已有仓位按止损止盈管理"
     return item
 
 
@@ -5932,6 +6382,11 @@ def update_watchlist(top10: list[dict[str, Any]], buy_rows: list[dict[str, Any]]
     positions: dict[str, Any] = dict(previous.get("positions") or {})
     history: list[dict[str, Any]] = list(previous.get("history") or [])
     top_map = {row["symbol"]: row for row in top10}
+    candidate_map = {
+        str(row.get("symbol") or ""): row
+        for row in read_json_if_exists(OUTPUTS / "candidates_top50.json", [])
+        if isinstance(row, dict) and row.get("symbol")
+    }
     buy_symbols = {row["symbol"] for row in buy_rows}
     entry_min_score = safe_float(env.get("WATCHLIST_ENTRY_MIN_SCORE"), 55.0)
     exit_absent_days = int(env.get("WATCHLIST_EXIT_ABSENT_DAYS", "3"))
@@ -5966,6 +6421,8 @@ def update_watchlist(top10: list[dict[str, Any]], buy_rows: list[dict[str, Any]]
             "last_seen": today,
             "last_rank": rank,
             "last_score": row.get("total_score"),
+            "last_raw_score": row.get("raw_total_score", row.get("total_score")),
+            "last_risk_adjusted_score": row.get("risk_adjusted_score", row.get("total_score")),
             "last_rating": row.get("rating"),
             "last_action": row.get("action"),
             "last_risk": row.get("risk"),
@@ -5994,6 +6451,7 @@ def update_watchlist(top10: list[dict[str, Any]], buy_rows: list[dict[str, Any]]
     for symbol, pos in list(positions.items()):
         if symbol in top_map:
             continue
+        refresh_watch_position_from_market(pos, candidate_map.get(symbol))
         pos["absent_days"] = int(pos.get("absent_days") or 0) + 1
         age_days = days_between(str(pos.get("first_seen") or today), today)
         exit_reason = ""
@@ -6015,8 +6473,8 @@ def update_watchlist(top10: list[dict[str, Any]], buy_rows: list[dict[str, Any]]
         "history": (history + [{"date": today, "top10": [row["symbol"] for row in top10], "buy": list(buy_symbols), "events": events}])[-60:],
     }
     write_json(state_path, state)
-    watch_report = render_watchlist_markdown(state, events)
-    alert_report = render_buy_alerts_markdown(buy_rows, events)
+    watch_report = public_report_text(render_watchlist_markdown(state, events))
+    alert_report = public_report_text(render_buy_alerts_markdown(buy_rows, events))
     write_text(OUTPUTS / "watchlist_today.md", watch_report)
     write_text(OUTPUTS / "buy_alerts.md", alert_report)
     return {"state": state, "events": events, "watch_report": watch_report, "alert_report": alert_report}
@@ -6031,10 +6489,43 @@ def read_json_file(path: Path, default: Any) -> Any:
     return default
 
 
+def refresh_watch_position_from_market(pos: dict[str, Any], market: dict[str, Any] | None) -> None:
+    if not market:
+        return
+    close = first_positive(market.get("close"))
+    if close <= 0:
+        return
+    risk = normalize_risk(pos.get("last_risk") or market.get("risk") or "medium")
+    levels = build_price_levels({"symbol": pos.get("symbol"), **market}, risk)
+    if not levels:
+        return
+    pos["last_close"] = levels.get("reference_price") or pos.get("last_close")
+    pos["buy_zone"] = levels.get("buy_zone") or pos.get("buy_zone")
+    pos["breakout_price"] = levels.get("breakout_price") or pos.get("breakout_price")
+    pos["stop_loss"] = levels.get("stop_loss") or pos.get("stop_loss")
+    pos["take_profit_1"] = levels.get("take_profit_1") or pos.get("take_profit_1")
+    pos["take_profit_2"] = levels.get("take_profit_2") or pos.get("take_profit_2")
+    pos["ret_20d"] = safe_float(market.get("ret_20d"), safe_float(pos.get("ret_20d")))
+
+
 def watch_entry_reason(row: dict[str, Any]) -> str:
     if row.get("buy_eligible"):
         return "三层信号接近买入池，继续观察价位确认"
     return row.get("quality_note") or "进入 Top10，等待信号改善"
+
+
+def format_score_line(row: dict[str, Any]) -> str:
+    adjusted = row.get("risk_adjusted_score", row.get("total_score", "-"))
+    raw = row.get("raw_total_score", adjusted)
+    return f"风控后综合分：{adjusted}；原始综合分：{raw}"
+
+
+def format_position_advice(row: dict[str, Any]) -> str:
+    advice = str(row.get("position_advice") or "").strip()
+    action = str(row.get("action") or "")
+    if "0% 新仓" in advice or ("建议 0%" in advice and action == "持有"):
+        return "空仓不买，已有仓位按止损止盈管理"
+    return advice or "-"
 
 
 def extract_ret_20d(row: dict[str, Any]) -> float:
@@ -6066,7 +6557,7 @@ def render_watchlist_markdown(watch: dict[str, Any], events: list[dict[str, Any]
             f"{idx}. {pos.get('name') or pos.get('symbol')} {pos.get('symbol')}",
             f"状态：{watch_status_label(str(pos.get('status')))}",
             f"连续/累计观察：{pos.get('seen_count', 0)} 次；未进 Top10：{pos.get('absent_days', 0)} 天",
-            f"最近排名：{pos.get('last_rank', '-')}; 综合分：{pos.get('last_score', '-')}; 评级：{pos.get('last_rating', '-')}",
+            f"最近排名：{pos.get('last_rank', '-')}; 风控后综合分：{pos.get('last_risk_adjusted_score', pos.get('last_score', '-'))}; 原始综合分：{pos.get('last_raw_score', pos.get('last_score', '-'))}; 评级：{pos.get('last_rating', '-')}",
             f"执行分档：{pos.get('trade_bucket_label') or '-'}；触发：{pos.get('trade_trigger') or '-'}",
             f"价格：参考 {pos.get('last_close') or '-'}；买入区 {pos.get('buy_zone') or '-'}；突破 {pos.get('breakout_price') or '-'}；止损 {pos.get('stop_loss') or '-'}",
             f"未买原因：{pos.get('quality_note') or '已通过'}",
@@ -6407,6 +6898,9 @@ def tradingagents_gate_label(ta_item: dict[str, Any]) -> str:
     if status == "quick_fallback":
         detail = translate_failure_note(note)
         return f"TradingAgents 完整版失败：{detail}"
+    if status == "failed":
+        detail = translate_failure_note(note)
+        return f"TradingAgents 完整版未完成：{detail}"
     if status == "fallback":
         detail = translate_failure_note(note)
         return f"TradingAgents 不可用：{detail}"
@@ -6657,7 +7151,7 @@ def strip_actionable_price_sentences(text: Any) -> str:
         "新增资金", "目标仓位", "连续站稳", "收复", "均线",
         "站稳", "提高至", "基准", "纪律线", "浮盈", "兑现", "降至", "收于",
         "第一纪律", "第二纪律", "止盈位", "止损位", "持仓", "新建仓", "建仓",
-        "升至", "回落", "高位", "持有期", "战术调整", "时间 horizon", "time horizon",
+        "升至", "回落", "高位", "持有期", "战术调整", "时间 horizon", "time horizon", "估值参考",
     )
     sentences = re.split(r"(?<=[。！？；;，,])\s*", clean)
     kept: list[str] = []
@@ -6666,6 +7160,33 @@ def strip_actionable_price_sentences(text: Any) -> str:
         if not s:
             continue
         if any(term in s for term in action_terms):
+            continue
+        kept.append(s)
+    return " ".join(kept).strip("；;，,、 ")
+
+
+def strip_internal_error_sentences(text: Any) -> str:
+    clean = " ".join(str(text or "").split())
+    if not clean:
+        return ""
+    internal_terms = (
+        "架构错误",
+        "架构返回错误",
+        "工具返回不可用错误",
+        "不可用错误",
+        "Traceback",
+        "Exception",
+        "internal error",
+        "Internal error",
+        "get_verified_market_snapshot",
+    )
+    sentences = re.split(r"(?<=[。！？；;，,])\s*", clean)
+    kept: list[str] = []
+    for sentence in sentences:
+        s = sentence.strip()
+        if not s:
+            continue
+        if any(term in s for term in internal_terms):
             continue
         kept.append(s)
     return " ".join(kept).strip("；;，,、 ")
@@ -6701,13 +7222,20 @@ def humanize_report_chinese(text: Any) -> str:
         ("Breakout Buy", "突破买入"),
         ("Watch Only", "只观察"),
         ("Buy Now", "立即买入"),
-        ("TradingAgents", "多智能体投研"),
-        ("Vibe-Trading", "量化复核"),
-        ("Dexter", "美股辅助研究"),
-        ("Serenity", "白毛瓶颈法"),
+        ("TradingAgents", "深度投研层"),
+        ("tradingagents", "深度投研层"),
+        ("Vibe-Trading", "量化风控复核"),
+        ("vibe_trading", "量化风控复核"),
+        ("Dexter", "辅助研究层"),
+        ("dexter", "辅助研究层"),
+        ("Serenity", "外部供应链线索"),
         ("dokobot", "外部简报"),
-        ("OpenBB", "数据中台"),
-        ("Kronos", "趋势预测"),
+        ("OpenBB", "行情数据层"),
+        ("Kronos", "趋势预测层"),
+        ("UZI", "投委复核"),
+        ("uzi", "投委复核"),
+        ("final_report", "最终报告"),
+        ("dsa", "初筛层"),
         ("Universe", "股票池"),
         ("Top10", "十大观察池"),
         ("Buy3", "三只买入候选"),
@@ -6727,7 +7255,7 @@ def humanize_report_chinese(text: Any) -> str:
         "WATCH": "观察",
         "AI": "人工智能",
         "DSA": "初筛层",
-        "Agent": "智能体",
+        "Agent": "研究模块",
         "fallback": "降级",
         "degraded": "部分数据降级",
         "full": "完整",
@@ -6735,7 +7263,47 @@ def humanize_report_chinese(text: Any) -> str:
     }
     for source, target in word_replacements.items():
         clean = re.sub(rf"\b{re.escape(source)}\b", target, clean, flags=re.IGNORECASE)
+    clean = re.sub(r"(初筛层|行情数据层|趋势预测层|辅助研究层|深度投研层|投委复核层?|量化风控复核层?|最终报告)\s+(?=[\u4e00-\u9fff])", r"\1", clean)
+    clean = clean.replace("投委复核投委", "投委")
+    clean = clean.replace("D档 只观察， 只观察", "D档 只观察")
+    clean = clean.replace("D档 只观察；触发：只观察", "D档 只观察；触发：保持观察")
+    clean = clean.replace("部分数据降级", "部分数据不足")
+    clean = clean.replace("：降级", "：数据不足")
     return clean
+
+
+def public_report_text(text: Any) -> str:
+    return humanize_report_chinese(text)
+
+
+def public_layer_name(value: Any) -> str:
+    text = str(value or "").strip()
+    mapping = {
+        "dsa": "初筛层",
+        "daily_stock_analysis": "初筛层",
+        "openbb": "行情数据层",
+        "kronos": "趋势预测层",
+        "dexter": "辅助研究层",
+        "tradingagents": "深度投研层",
+        "uzi": "投委复核层",
+        "vibe_trading": "量化风控复核层",
+        "final_report": "最终报告",
+        "telegram": "通知发送",
+        "telegram_done": "通知已发送",
+        "telegram_failed": "通知发送失败",
+        "formal": "正式模式",
+        "smoke": "连通性测试",
+        "diagnostic": "诊断模式",
+        "ok": "通过",
+        "failed": "失败",
+        "in_progress": "进行中",
+    }
+    return mapping.get(text, text)
+
+
+def public_layer_list(values: Any) -> str:
+    names = [public_layer_name(item) for item in (values or []) if str(item).strip()]
+    return "、".join(names) or "无"
 
 
 def render_bucket_section(top10: list[dict[str, Any]]) -> list[str]:
@@ -6783,11 +7351,11 @@ def render_short_watch_section(top10: list[dict[str, Any]]) -> list[str]:
 
 def render_serenity_section(top10: list[dict[str, Any]]) -> list[str]:
     rows = [row for row in top10 if row.get("serenity_signal")]
-    lines = ["## 白毛/Serenity 外部参考", ""]
+    lines = ["## 外部供应链线索参考", ""]
     if not rows:
         lines += [
-            "今日 Top10 未命中白毛/Serenity 外部参考。",
-            "系统仍会读取 dokobot 每日简报；命中后只作为外部信息参考，不参与正式评分，也不会直接触发买入。",
+            "今日十大观察池未命中外部供应链瓶颈线索。",
+            "外部简报只用于提示待验证线索，不参与正式评分，也不会直接触发买入。",
             "",
         ]
         return lines
@@ -6795,7 +7363,7 @@ def render_serenity_section(top10: list[dict[str, Any]]) -> list[str]:
     tier_order = {"第一优先级": 0, "第二优先级": 1, "第三优先级": 2, "外部线索": 3, "警惕名单": 4}
     rows.sort(key=lambda row: (tier_order.get(str(row["serenity_signal"].get("tier")), 9), -safe_float(row.get("total_score"))))
     lines += [
-        "口径：白毛/Serenity 与 dokobot 简报只作为外部信息参考，用来提示可能的供应链瓶颈和待验证线索；不参与正式评分，不决定 Top10，不触发 Buy3。买入仍需 DSA、TradingAgents、UZI/Vibe 和价位确认。",
+        "口径：外部简报只提示可能的供应链瓶颈和待验证线索；不参与正式评分，不决定十大观察池，不触发三只买入候选。买入仍需初筛层、深度投研层、投委复核、量化风控复核和价位确认。",
         "",
     ]
     for row in rows[:10]:
@@ -6813,29 +7381,16 @@ def render_serenity_section(top10: list[dict[str, Any]]) -> list[str]:
 def render_serenity_bottleneck_section(rows: list[dict[str, Any]] | None = None) -> list[str]:
     if rows is None:
         rows = read_json_if_exists(OUTPUTS / "serenity_bottleneck_watchlist.json", [])
-    lines = ["## 白毛/Serenity 瓶颈体系（单列）", ""]
+    lines = ["## 供应链瓶颈观察清单（单列）", ""]
     lines += [
-        "口径：这是另一套找股票体系，只单列候选，不混入原 Top10/Buy3 评分。它寻找 BOM/供应链里成本小、替代难、扩产慢、集中度高的瓶颈环节；美股/港股口径使用“非主流共识、供应紧、客户依赖度高、扩产周期长”。",
+        "口径：这是外部线索清单，只单列候选，不混入十大观察池/三只买入候选评分。它寻找 BOM/供应链中成本小、替代难、扩产慢、集中度高的瓶颈环节；美股/港股重点看非主流共识、供应紧、客户依赖度高、扩产周期长。",
         "",
     ]
     if not rows:
         lines += ["今日没有独立瓶颈候选。", ""]
         return lines
     for row in rows[:8]:
-        red_blocks = [x for x in (row.get("red_team") or []) if x.get("block_buy")]
-        milestones = row.get("milestones") or []
-        secondary = row.get("baimao_secondary") or {}
-        lines += [
-            f"- {row.get('name') or row['symbol']} {row['symbol']}：{row.get('tier')} / {row.get('role')}；体系分 {row.get('serenity_score')}；动作 {row.get('action')}",
-            f"  白毛二次分析：{secondary.get('secondary_score', '-')} / {secondary.get('rating', '-')} / {secondary.get('verdict', '-')}",
-            f"  综合结论：{secondary.get('conclusion', '-')}",
-            f"  月度初筛：{row.get('bottleneck')}；拥挤度：{(row.get('monthly_screen') or {}).get('crowding_check')}",
-            f"  季度复审：毛利率、CapEx/在建工程、订单/backlog、客户集中度、研报/社媒拥挤度待复核",
-            f"  买前红队：{'红队阻断，Watch Only' if red_blocks else '暂未阻断，仍需证伪'}",
-        ]
-        if milestones:
-            m = milestones[0]
-            lines.append(f"  持股监控：{m.get('event')}｜{m.get('deadline')}｜{m.get('kill_threshold')}")
+        lines += public_bottleneck_bullet(row)
     lines.append("")
     return lines
 
@@ -6865,14 +7420,18 @@ def apply_flow_status_to_report(
 def render_flow_status_section(status: dict[str, object] | None) -> list[str]:
     if not status:
         return []
-    completed = "、".join(str(layer) for layer in (status.get("completed_layers") or [])) or "无"
-    missing = "、".join(str(layer) for layer in (status.get("missing_layers") or [])) or "无"
-    reasons = [str(reason) for reason in (status.get("blocking_reasons") or []) if str(reason).strip()]
+    completed = public_layer_list(status.get("completed_layers") or [])
+    missing = public_layer_list(status.get("missing_layers") or [])
+    reasons = [
+        humanize_report_chinese(reason)
+        for reason in (status.get("blocking_reasons") or [])
+        if str(reason).strip()
+    ]
     lines = [
         "## 正式流程状态",
         "",
-        f"正式流程状态：{status.get('overall_status')}",
-        f"运行模式：{status.get('run_mode')}",
+        f"正式流程状态：{public_layer_name(status.get('overall_status'))}",
+        f"运行模式：{public_layer_name(status.get('run_mode'))}",
         f"已完成层：{completed}",
         f"未完成层：{missing}",
         f"可发布买入日报：{'是' if status.get('can_publish_buy_report') else '否'}",
@@ -6893,8 +7452,6 @@ def render_final_markdown(
     watch: dict[str, Any] | None = None,
     flow_status: dict[str, Any] | None = None,
 ) -> str:
-    if flow_status:
-        top10, buy3 = apply_flow_status_to_report(top10, buy3, flow_status)
     top10 = [prepare_report_row(row) for row in top10]
     buy3 = [prepare_report_row(row) for row in buy3]
     today = dt.date.today().isoformat()
@@ -6911,12 +7468,12 @@ def render_final_markdown(
     lines += [
         "## 漏斗",
         "",
-        f"Universe：{counts.get('universe', 0)}",
-        f"OpenBB 数据中台：{counts.get('openbb', 0)}",
-        f"Kronos 趋势预测：{counts.get('kronos', 0)}",
-        f"Dexter 美股辅助：{counts.get('dexter', 0)}",
-        f"Vibe-Trading 复核：{counts.get('vibe_trading', 0)}",
-        f"白毛/Serenity 瓶颈体系（单列）：{counts.get('serenity_bottleneck', 0)}",
+        f"股票池：{counts.get('universe', 0)}",
+        f"行情数据层：{counts.get('openbb', 0)}",
+        f"趋势预测层：{counts.get('kronos', 0)}",
+        f"辅助研究层：{counts.get('dexter', 0)}",
+        f"量化风控复核：{counts.get('vibe_trading', 0)}",
+        f"供应链瓶颈观察清单（单列）：{counts.get('serenity_bottleneck', 0)}",
         f"初筛：{counts.get('screen', 0)}",
         f"深度研究：{counts.get('research', 0)}",
         f"投资委员会：{counts.get('committee', 0)}",
@@ -6929,7 +7486,7 @@ def render_final_markdown(
     lines += [
         "## 执行口径",
         "",
-        "所有可执行价位只以本报告的“价格计划 / 买入条件 / 卖出条件”为准；TradingAgents、Vibe-Trading、外部研究原始正文中的旧价位会被剥离，不作为下单依据。",
+        "所有可执行价位只以本报告的“价格计划 / 买入条件 / 卖出条件”为准；深度投研、量化风控复核、外部研究原始正文中的旧价位会被剥离，不作为下单依据。",
         "",
     ]
     lines += render_bucket_section(top10)
@@ -6938,20 +7495,20 @@ def render_final_markdown(
     if not buy3:
         lines += [
             "今日无满足严格买入条件的股票。",
-            "规则：TradingAgents 完整版完成、UZI 分数不低于 60、UZI 结论不偏谨慎或看空、20日涨幅不过热、三层信号同向。",
+            "规则：深度投研完成、投委复核分数不低于 60、投委结论不偏谨慎或看空、20日涨幅不过热、三层信号同向。",
             "",
         ]
     for idx, row in enumerate(buy3, 1):
         lines += [
             f"{idx}. {row.get('name') or row['symbol']} {row['symbol']}",
             f"买入结论：{row.get('buy_decision')}",
-            f"综合分：{row['total_score']}",
+            format_score_line(row),
             f"评级：{row['rating']}",
             f"买卖建议：{row.get('trade_advice')}",
             f"价格计划：{row.get('price_plan') or '暂无有效参考价，等下一轮日线数据补齐'}",
             f"买入条件：{row.get('buy_advice')}",
             f"卖出条件：{row.get('sell_advice')}",
-            f"仓位建议：{row.get('position_advice')}",
+            f"仓位建议：{format_position_advice(row)}",
             f"风控闸门：{row.get('quality_note') or '通过'}",
             f"选择理由：{complete_excerpt(row.get('reason', ''), 720)}",
             "",
@@ -6973,7 +7530,7 @@ def render_final_markdown(
     for idx, row in enumerate(top10, 1):
         lines += [
             f"{idx}. {row.get('name') or row['symbol']} {row['symbol']}",
-            f"综合分：{row['total_score']}",
+            format_score_line(row),
             f"评级：{row['rating']}",
             f"操作：{row.get('action') or '观察'}",
             f"执行分档：{row.get('trade_bucket_label') or 'D档 Watch Only'}",
@@ -6982,15 +7539,15 @@ def render_final_markdown(
             f"价格计划：{row.get('price_plan') or '暂无有效参考价，等下一轮日线数据补齐'}",
             f"买入条件：{row.get('buy_advice')}",
             f"卖出条件：{row.get('sell_advice')}",
-            f"仓位建议：{row.get('position_advice')}",
+            f"仓位建议：{format_position_advice(row)}",
             f"风险：{row.get('risk') or '中'}",
             f"先验一致性：{format_pretrade_audit_line(row)}",
             f"买入资格：{'通过' if row.get('buy_eligible') else '未通过'}",
             f"风控闸门：{row.get('quality_note') or '通过'}",
-            f"Serenity：{format_serenity_line(row)}",
-            f"UZI质量：{format_uzi_quality_line(row)}",
+            f"外部线索：{format_serenity_line(row)}",
+            f"投委复核质量：{format_uzi_quality_line(row)}",
             f"做空观察：{format_short_watch_line(row)}",
-            f"分解：DSA {row['dsa_score']} ×30% / TradingAgents {row['tradingagents_score']} ×40% / {format_committee_score_line(row)} ×30%",
+            f"分解：初筛层 {row['dsa_score']} ×30% / 深度投研层 {row['tradingagents_score']} ×40% / {format_committee_score_line(row)} ×30%",
             f"选择理由：{complete_excerpt(row.get('reason', ''), 720)}",
             "",
         ]
@@ -7025,7 +7582,7 @@ def format_pretrade_audit_line(row: dict[str, Any]) -> str:
 def format_serenity_line(row: dict[str, Any]) -> str:
     sig = row.get("serenity_signal") or {}
     if not sig:
-        return "未命中白毛/Serenity 外部瓶颈信号"
+        return "未命中外部供应链瓶颈线索"
     return (
         f"{sig.get('tier') or '外部线索'} / {sig.get('role') or '-'}；"
         f"瓶颈 {sig.get('bottleneck') or '-'}；证据 {sig.get('evidence_level') or '弱'}；"
@@ -7056,16 +7613,34 @@ def format_committee_score_line(row: dict[str, Any]) -> str:
     score = row.get("uzi_score")
     raw = row.get("raw_uzi_score")
     if source == "备用投委评分":
-        return f"备用投委 {score}（原UZI {raw}）"
-    return f"UZI {score}"
+        return f"备用投委复核 {score}（原始分 {raw}）"
+    return f"投委复核 {score}"
+
+
+def telegram_text_for_status(markdown: str, status: dict[str, object]) -> str:
+    if status.get("can_publish_buy_report") is True:
+        return markdown
+    reasons = [str(reason) for reason in (status.get("blocking_reasons") or []) if str(reason).strip()]
+    evidence = [str(path) for path in (status.get("evidence_files") or []) if str(path).strip()]
+    lines = [
+        "正式流程未完成，今日不发布可执行买入日报。",
+        f"运行模式：{status.get('run_mode')}",
+        f"整体状态：{status.get('overall_status')}",
+        "",
+        "阻断原因：",
+    ]
+    lines.extend(f"- {reason}" for reason in reasons[:10])
+    if evidence:
+        lines += ["", "证据文件："]
+        lines.extend(f"- {path}" for path in evidence[:10])
+    return "\n".join(lines)
 
 
 def telegram_send(env: dict[str, str], text: str) -> None:
     token = env.get("TELEGRAM_BOT_TOKEN")
     chat_id = telegram_chat_id(env)
     if not token or not chat_id:
-        print("Telegram not configured; final report left in outputs/final_top10.md")
-        return
+        raise RuntimeError("Telegram not configured: TELEGRAM_BOT_TOKEN and chat id are required")
     chunks = split_telegram_text(text, max_chars=3600)
     for idx, chunk in enumerate(chunks, 1):
         prefix = f"（{idx}/{len(chunks)}）\n" if len(chunks) > 1 else ""
@@ -7074,13 +7649,11 @@ def telegram_send(env: dict[str, str], text: str) -> None:
             payload["message_thread_id"] = env["TELEGRAM_MESSAGE_THREAD_ID"]
         api_base = env.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
         url = f"{api_base}/bot{token}/sendMessage"
-        try:
-            body = telegram_post(url, payload, env)
-            result = json.loads(body)
-            if not result.get("ok"):
-                print(f"Telegram send failed: {body}")
-        except Exception as exc:
-            print(f"Telegram send failed: {exc}")
+        body = telegram_post(url, payload, env)
+        result = json.loads(body)
+        if not result.get("ok"):
+            detail = str(result.get("description") or body)
+            raise RuntimeError(f"Telegram send failed: {detail}")
 
 
 def telegram_chat_id(env: dict[str, str]) -> str:
@@ -7175,6 +7748,439 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
+RECOVERABLE_TRADINGAGENTS_OUTPUT_MARKERS = (
+    "BrokenPipeError",
+    "服务器连接失败",
+    "接收数据异常",
+)
+
+
+def recoverable_tradingagents_output_note(text: str) -> str:
+    body = str(text or "")
+    for marker in RECOVERABLE_TRADINGAGENTS_OUTPUT_MARKERS:
+        if marker in body:
+            return marker
+    return ""
+
+
+def write_stage_status(
+    *,
+    run_mode: str,
+    stage: str,
+    overall_status: str,
+    blocking_reasons: list[str] | None = None,
+    can_publish_buy_report: bool = False,
+    **extra_fields: Any
+) -> dict[str, Any]:
+    """Write pipeline stage status to outputs/pipeline_status.json"""
+    import time
+    status: dict[str, Any] = {
+        "run_mode": run_mode,
+        "overall_status": overall_status,
+        "stage": stage,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "blocking_reasons": blocking_reasons or [],
+        "can_publish_buy_report": can_publish_buy_report,
+    }
+    status.update(extra_fields)
+    status["public_stage"] = public_layer_name(stage)
+    status["public_overall_status"] = public_layer_name(overall_status)
+    status["public_blocking_reasons"] = [
+        public_report_text(reason)
+        for reason in (blocking_reasons or [])
+        if str(reason).strip()
+    ]
+    if "completed_layers" in status:
+        status["public_completed_layers"] = public_layer_list(status.get("completed_layers") or [])
+    if "missing_layers" in status:
+        status["public_missing_layers"] = public_layer_list(status.get("missing_layers") or [])
+
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    status_file = OUTPUTS / "pipeline_status.json"
+    write_json(status_file, status)
+    return status
+
+
+def build_failed_flow_status(
+    *,
+    run_mode: str,
+    stage: str,
+    exc: Exception,
+    **extra_fields: Any
+) -> dict[str, Any]:
+    """Build failure status dict from exception"""
+    import time
+    error_info: dict[str, Any] = {
+        "type": type(exc).__name__,
+        "message": str(exc)[:300],
+    }
+    status: dict[str, Any] = {
+        "run_mode": run_mode,
+        "stage": stage,
+        "overall_status": "failed",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "error": error_info,
+        "can_publish_buy_report": False,
+    }
+    status.update(extra_fields)
+    return status
+
+
+def run_tradingagents_full_one(
+    item: dict[str, Any],
+    *,
+    trading_dir: Path,
+    python_bin: str = "python3",
+    env: dict[str, str] | None = None,
+    timeout: int = 1800
+) -> dict[str, Any]:
+    """Run real TradingAgents full analysis for a single symbol.
+
+    Calls the genuine TRADINGAGENTS_SNIPPET via run() (synchronous, with
+    per-stock timeout). In formal flow, incomplete single-symbol runs return
+    explicit failed rows so the stage can block publication.
+    """
+    import time
+    if env is None:
+        env = dict(os.environ)
+
+    symbol = to_tradingagents_symbol(item["symbol"])
+    run_env = dict(env)
+    run_env["PIPELINE_TA_TICKER"] = symbol
+    run_env["PIPELINE_TA_DATE"] = env.get("PIPELINE_TA_DATE") or dt.date.today().isoformat()
+
+    print(f"[TA-ONE] {symbol}: Starting (timeout={timeout}s)", flush=True)
+    start = time.time()
+
+    try:
+        rc, text = run([python_bin, "-c", TRADINGAGENTS_SNIPPET], trading_dir, run_env, timeout=timeout)
+        elapsed = time.time() - start
+        print(f"[TA-ONE] {symbol}: Completed in {elapsed:.1f}s", flush=True)
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - start
+        print(f"[TA-ONE] {symbol}: Timeout after {elapsed:.1f}s (limit={timeout}s)", flush=True)
+        return failed_tradingagents_result(item, f"timeout after {timeout}s", "timeout")
+    except (BrokenPipeError, OSError, subprocess.CalledProcessError) as exc:
+        elapsed = time.time() - start
+        print(f"[TA-ONE] {symbol}: Error after {elapsed:.1f}s: {type(exc).__name__}", flush=True)
+        note = recoverable_tradingagents_output_note(str(exc)) or type(exc).__name__
+        return failed_tradingagents_result(item, note, type(exc).__name__)
+
+    recoverable_note = recoverable_tradingagents_output_note(text)
+    if recoverable_note:
+        print(f"[TA-ONE] {symbol}: Recoverable error: {recoverable_note}", flush=True)
+        return failed_tradingagents_result(item, recoverable_note, "recoverable_output")
+    write_text(WORK / f"tradingagents_{safe_name(symbol)}.log", text)
+    parsed = parse_last_json(text)
+    if rc != 0 or not parsed:
+        fail_note = summarize_failure(text, rc)
+        print(f"[TA-ONE] {symbol}: Parse failed: {fail_note}", flush=True)
+        return failed_tradingagents_result(item, fail_note, "invalid_output")
+    print(f"[TA-ONE] {symbol}: Success", flush=True)
+    return normalize_trading_result(item, parsed, text)
+
+
+def finalize_tradingagents_stage(rows: list[dict[str, Any]], ta_meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Finalize TA stage: sort by score and write output files"""
+    # Sort by score descending
+    ranked_rows = sorted(rows, key=lambda x: x.get("score", 0), reverse=True)
+
+    # Ensure outputs directory exists
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+    # Write full diagnostic version
+    full_file = OUTPUTS / "tradingagents_full_top20.json"
+    write_json(full_file, ranked_rows[:20])
+
+    # Write production version
+    prod_file = OUTPUTS / "tradingagents_top20.json"
+    write_json(prod_file, ranked_rows[:20])
+
+    return ranked_rows
+
+
+def build_flow_status(
+    run_mode: str,
+    stage: str | None = None,
+    overall_status: str | None = None,
+    ta_stage_meta: dict[str, Any] | None = None,
+    **extra_fields: Any
+) -> dict[str, Any]:
+    """Build pipeline flow status.
+
+    Supports both:
+    1. Stage-oriented status writer call shape
+    2. Existing report-oriented flow-status call shape used by main()
+    """
+    if "env" in extra_fields:
+        env = extra_fields["env"]
+        counts = extra_fields["counts"]
+        trading = extra_fields["trading"]
+        uzi = extra_fields["uzi"]
+        vibe_review = extra_fields["vibe_review"]
+        final_report_written = extra_fields["final_report_written"]
+        telegram_enabled = extra_fields["telegram_enabled"]
+        telegram_sent = extra_fields["telegram_sent"]
+        ta_stage_meta = ta_stage_meta or extra_fields.get("ta_stage_meta")
+
+        completed_layers: list[str] = []
+        missing_layers: list[str] = []
+        blocking_reasons: list[str] = []
+        evidence_files = [
+            "outputs/candidates_top50.json",
+            "outputs/tradingagents_top20.json",
+            "outputs/uzi_top10.json",
+            "outputs/final_top10.md",
+            "outputs/final_top10.json",
+        ]
+
+        if run_mode != "formal":
+            return {
+                "run_mode": run_mode,
+                "overall_status": "ok",
+                "completed_layers": ["smoke" if run_mode == "smoke" else "diagnostic"],
+                "missing_layers": [],
+                "blocking_reasons": [f"{run_mode} 模式只证明连线或单层诊断，不代表正式日报完成"],
+                "evidence_files": evidence_files,
+                "can_publish_buy_report": False,
+                "telegram_enabled": telegram_enabled,
+                "telegram_sent": telegram_sent,
+            }
+
+        if env.get("PIPELINE_SKIP_TRADINGAGENTS") == "1":
+            missing_layers.append("tradingagents")
+            blocking_reasons.append("正式日报禁止 PIPELINE_SKIP_TRADINGAGENTS=1")
+        if env.get("PIPELINE_SKIP_UZI") == "1":
+            missing_layers.append("uzi")
+            blocking_reasons.append("正式日报禁止 PIPELINE_SKIP_UZI=1")
+        if env.get("PIPELINE_TRADINGAGENTS_ALLOW_INCOMPLETE_FINAL") == "1":
+            missing_layers.append("tradingagents")
+            blocking_reasons.append("正式日报禁止 PIPELINE_TRADINGAGENTS_ALLOW_INCOMPLETE_FINAL=1")
+
+        if counts.get("screen", 0) > 0:
+            completed_layers.append("dsa")
+        else:
+            missing_layers.append("dsa")
+            blocking_reasons.append("DSA 初筛未产出候选")
+
+        bad_ta = [str(row.get("symbol") or "?") for row in trading if not status_is_full_tradingagents(row)]
+        if trading and not bad_ta:
+            completed_layers.append("tradingagents")
+        else:
+            missing_layers.append("tradingagents")
+            detail = "、".join(bad_ta[:8]) if bad_ta else "无深度投研层完整版结果"
+            blocking_reasons.append(f"深度投研层未正式完成：{detail}")
+
+        if ta_stage_meta:
+            ta_stage_status = str(ta_stage_meta.get("ta_stage_status") or "unknown")
+            ta_completed_full = int(ta_stage_meta.get("ta_completed_full") or 0)
+            ta_total_symbols = int(ta_stage_meta.get("ta_total_symbols") or 0)
+            ta_failed_symbols = [str(symbol) for symbol in (ta_stage_meta.get("ta_failed_symbols") or [])]
+            if ta_stage_status != "completed" or ta_completed_full != ta_total_symbols or ta_failed_symbols:
+                missing_layers.append("tradingagents")
+                failed_detail = "、".join(ta_failed_symbols[:8]) if ta_failed_symbols else "无失败 symbol 明细"
+                blocking_reasons.append(
+                    f"TradingAgents stage meta 未正式完成：{ta_stage_status} "
+                    f"full={ta_completed_full}/{ta_total_symbols} failed={failed_detail}"
+                )
+
+        bad_uzi = []
+        for row in uzi:
+            if not status_is_ok_uzi(row):
+                flags = "；".join(str(flag) for flag in (row.get("quality_flags") or []))
+                bad_uzi.append(f"{row.get('symbol') or '?'} {row.get('status') or 'unknown'} {flags}".strip())
+        if uzi and not bad_uzi:
+            completed_layers.append("uzi")
+        else:
+            missing_layers.append("uzi")
+            detail = "；".join(bad_uzi[:8]) if bad_uzi else "无 UZI ok 投委结果"
+            blocking_reasons.append(f"UZI 未正式完成：{detail}")
+
+        vibe_enabled = env.get("VIBE_TRADING_ENABLED", "0") == "1"
+        if vibe_enabled:
+            if str(vibe_review.get("status") or "") == "ok":
+                completed_layers.append("vibe_trading")
+            else:
+                missing_layers.append("vibe_trading")
+                blocking_reasons.append(f"Vibe-Trading 未正式完成：{vibe_review.get('status') or 'unknown'}")
+
+        if final_report_written:
+            completed_layers.append("final_report")
+        else:
+            missing_layers.append("final_report")
+            blocking_reasons.append("最终报告未生成")
+
+        if telegram_enabled:
+            if telegram_sent is True:
+                completed_layers.append("telegram")
+            else:
+                missing_layers.append("telegram")
+                blocking_reasons.append("Telegram 启用但未发送成功")
+
+        missing_layers = list(dict.fromkeys(missing_layers))
+        completed_layers = list(dict.fromkeys(layer for layer in completed_layers if layer not in missing_layers))
+        report_overall_status = "ok" if not missing_layers and not blocking_reasons else "failed"
+        return {
+            "run_mode": "formal",
+            "overall_status": report_overall_status,
+            "completed_layers": completed_layers,
+            "missing_layers": missing_layers,
+            "blocking_reasons": blocking_reasons,
+            "evidence_files": evidence_files,
+            "can_publish_buy_report": report_overall_status == "ok",
+            "telegram_enabled": telegram_enabled,
+            "telegram_sent": telegram_sent,
+        }
+
+    flow_status = {
+        "run_mode": run_mode,
+        "stage": stage,
+        "overall_status": overall_status,
+        "can_publish_buy_report": True,
+    }
+
+    if run_mode == "formal" and ta_stage_meta:
+        if ta_stage_meta.get("ta_stage_status") != "completed":
+            flow_status["can_publish_buy_report"] = False
+
+    flow_status.update(extra_fields)
+    return flow_status
+
+
+def run_tradingagents_full_batch(
+    candidates: list[dict[str, Any]],
+    *,
+    trading_dir: str,
+    python_bin: str,
+    env: dict[str, str],
+    per_stock_timeout: int = 1800,
+    stage_timeout: int = 3600,
+    max_workers: int = 4
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Batch scheduler for real TradingAgents full execution.
+
+    Submits each symbol to run_tradingagents_full_one via a thread pool, then
+    polls future.done() (instead of as_completed, which can block the stage
+    hard-cap). Enforces an overall stage_timeout. Per-stock timeout is enforced
+    inside run() so a single hung process cannot exceed per_stock_timeout.
+    """
+    stage_timeout = int(env.get("PIPELINE_TRADINGAGENTS_STAGE_TIMEOUT") or os.environ.get("PIPELINE_TRADINGAGENTS_STAGE_TIMEOUT", str(stage_timeout)))
+
+    start = time.time()
+    completed_full = 0
+    failed_symbols: list[str] = []
+    results_by_symbol: dict[str, Any] = {}
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    timed_out = False
+
+    try:
+        future_to_symbol: dict[Any, str] = {}
+        for item in candidates:
+            symbol = item.get("symbol", "unknown")
+            future = executor.submit(
+                run_tradingagents_full_one,
+                item,
+                trading_dir=Path(trading_dir),
+                python_bin=python_bin,
+                env=env,
+                timeout=per_stock_timeout,
+            )
+            future_to_symbol[future] = symbol
+            results_by_symbol[symbol] = None
+
+        remaining_futures = set(future_to_symbol.keys())
+
+        while remaining_futures:
+            # Stage-level hard cap: mark unfinished symbols failed and stop polling.
+            if time.time() - start > stage_timeout:
+                print(f"TradingAgents stage timeout after {stage_timeout}s; force-shutdown executor")
+                timed_out = True
+                for future in remaining_futures:
+                    symbol = future_to_symbol[future]
+                    future.cancel()
+                    if symbol not in failed_symbols:
+                        failed_symbols.append(symbol)
+                    results_by_symbol[symbol] = {"ta_status": "stage_timeout"}
+                break
+
+            still_remaining = set()
+            for future in remaining_futures:
+                if future.done():
+                    symbol = future_to_symbol[future]
+                    try:
+                        result = future.result()
+                        results_by_symbol[symbol] = result
+                        if result.get("ta_status") == "full":
+                            completed_full += 1
+                        else:
+                            if symbol not in failed_symbols:
+                                failed_symbols.append(symbol)
+                    except Exception as e:
+                        if symbol not in failed_symbols:
+                            failed_symbols.append(symbol)
+                        results_by_symbol[symbol] = {"ta_status": "error", "error": str(e)}
+                else:
+                    still_remaining.add(future)
+
+            remaining_futures = still_remaining
+            if remaining_futures:
+                time.sleep(0.5)
+    finally:
+        if timed_out:
+            executor.shutdown(wait=False)
+            print("Executor shutdown without waiting for remaining tasks")
+        else:
+            executor.shutdown(wait=True)
+
+    elapsed = time.time() - start
+
+    if time.time() - start > stage_timeout:
+        ta_stage_status = "stage_timeout"
+    elif not failed_symbols:
+        ta_stage_status = "completed"
+    else:
+        ta_stage_status = "partial_failure"
+
+    rows: list[dict[str, Any]] = []
+    for item in candidates:
+        symbol = item.get("symbol", "unknown")
+        result = results_by_symbol.get(symbol) or {}
+        row = {
+            "symbol": symbol,
+            "company_name": item.get("company_name", ""),
+            "ta_decision": result.get("ta_status", "unknown"),
+            "ta_completed_full": completed_full,
+            "ta_failed_symbols": failed_symbols,
+        }
+        row.update(result)
+        rows.append(row)
+
+    metadata = {
+        "ta_stage_status": ta_stage_status,
+        "ta_completed_full": completed_full,
+        "ta_failed_symbols": failed_symbols,
+        "ta_total_symbols": len(candidates),
+        "ta_elapsed_seconds": round(elapsed, 2),
+    }
+
+    return rows, metadata
+
+
+def persist_flow_status(flow_status: dict[str, Any], *, stage: str) -> dict[str, Any]:
+    extra_fields = {
+        key: value for key, value in flow_status.items()
+        if key not in {"run_mode", "stage", "overall_status", "blocking_reasons", "can_publish_buy_report"}
+    }
+    return write_stage_status(
+        run_mode=str(flow_status.get("run_mode") or "formal"),
+        stage=stage,
+        overall_status=str(flow_status.get("overall_status") or "failed"),
+        blocking_reasons=list(flow_status.get("blocking_reasons") or []),
+        can_publish_buy_report=bool(flow_status.get("can_publish_buy_report")),
+        **extra_fields,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Hermes daily Top10 stock pipeline.")
     parser.add_argument("--pool", default=str(ROOT / "stock_pool.yaml"))
@@ -7182,6 +8188,9 @@ def main() -> None:
     parser.add_argument("--ta-top", type=int, default=None)
     parser.add_argument("--uzi-top", type=int, default=None)
     parser.add_argument("--buy-top", type=int, default=None)
+    parser.add_argument("--run-mode", choices=["formal", "smoke", "diagnostic"], help="Pipeline run mode. Defaults to PIPELINE_RUN_MODE or formal.")
+    parser.add_argument("--smoke", action="store_true", help="Mark this run as a smoke wiring test.")
+    parser.add_argument("--diagnostic", action="store_true", help="Mark this run as a diagnostic run.")
     parser.add_argument("--reuse-dsa", action="store_true", help="Reuse outputs/candidates_top50.json instead of rerunning DSA.")
     parser.add_argument("--send-telegram", action="store_true", default=None)
     args = parser.parse_args()
@@ -7195,18 +8204,49 @@ def main() -> None:
     ta_top = args.ta_top or int(env.get("PIPELINE_TRADINGAGENTS_TOP_N", "20"))
     uzi_top = args.uzi_top or int(env.get("PIPELINE_UZI_TOP_N", "10"))
     buy_top = args.buy_top or int(env.get("PIPELINE_BUY_TOP_N", "3"))
+    run_mode = determine_run_mode(env, args)
+    env["PIPELINE_RUN_MODE"] = run_mode
 
     pool = read_stock_pool(Path(args.pool))
     write_json(OUTPUTS / "stock_pool_resolved.json", pool)
     print(f"Loaded stock pool: {len(pool)} symbols")
 
+    write_stage_status(
+        run_mode=run_mode,
+        stage="openbb_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        counts={"universe": len(pool)},
+    )
     openbb_context = stage_openbb_context(pool, env)
     print(f"OpenBB context: {openbb_context.get('status')} / {openbb_context.get('symbol_count', 0)} symbols")
     enriched_context = build_enriched_stock_data(pool, env, openbb_context=openbb_context)
     print(f"Enriched data: {enriched_context.get('symbol_count', 0)} symbols / complete {enriched_context.get('complete_count', 0)}")
+
+    write_stage_status(
+        run_mode=run_mode,
+        stage="kronos_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        counts={
+            "universe": len(pool),
+            "openbb": int(openbb_context.get("symbol_count") or 0),
+        },
+    )
     kronos_context = stage_kronos_context(openbb_context, env)
     print(f"Kronos context: {kronos_context.get('status')} / {kronos_context.get('symbol_count', 0)} symbols")
 
+    write_stage_status(
+        run_mode=run_mode,
+        stage="dsa_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        counts={
+            "universe": len(pool),
+            "openbb": int(openbb_context.get("symbol_count") or 0),
+            "kronos": int(kronos_context.get("symbol_count") or 0),
+        },
+    )
     if args.reuse_dsa and (OUTPUTS / "candidates_top50.json").exists():
         candidates = json.loads((OUTPUTS / "candidates_top50.json").read_text(encoding="utf-8"))
     else:
@@ -7215,15 +8255,51 @@ def main() -> None:
     enriched_context = build_enriched_stock_data(pool, env, openbb_context=openbb_context, candidates=candidates)
     print(f"Enriched data refreshed after DSA: {enriched_context.get('symbol_count', 0)} symbols")
 
+    write_stage_status(
+        run_mode=run_mode,
+        stage="dexter_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        counts={
+            "universe": len(pool),
+            "openbb": int(openbb_context.get("symbol_count") or 0),
+            "kronos": int(kronos_context.get("symbol_count") or 0),
+            "screen": len(candidates),
+        },
+    )
     dexter_context = stage_dexter_context(candidates, env)
     print(f"Dexter context: {dexter_context.get('status')} / {dexter_context.get('symbol_count', 0)} symbols")
     candidates = apply_dexter_signals(candidates, dexter_context)
     write_json(OUTPUTS / "candidates_top50.json", candidates)
     enriched_context = build_enriched_stock_data(pool, env, openbb_context=openbb_context, candidates=candidates)
 
+    write_stage_status(
+        run_mode=run_mode,
+        stage="ta_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+    )
+
     trading = stage_tradingagents(candidates, env, ta_top)
+    ta_stage_meta = read_json_if_exists(OUTPUTS / "tradingagents_stage_meta.json", {})
     print(f"TradingAgents results: {len(trading)}")
     enriched_context = build_enriched_stock_data(pool, env, openbb_context=openbb_context, candidates=candidates, trading=trading)
+
+    write_stage_status(
+        run_mode=run_mode,
+        stage="ta_done",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        ta_stage_meta=ta_stage_meta,
+    )
+
+    write_stage_status(
+        run_mode=run_mode,
+        stage="uzi_in_progress",
+        overall_status="in_progress",
+        can_publish_buy_report=False,
+        ta_stage_meta=ta_stage_meta,
+    )
 
     uzi = stage_uzi(trading, env, uzi_top)
     print(f"UZI results: {len(uzi)}")
@@ -7233,12 +8309,9 @@ def main() -> None:
     vibe_review = stage_vibe_trading_review(final_rows, env)
     print(f"Vibe-Trading review: {vibe_review.get('status')} / {vibe_review.get('symbol_count', len(vibe_review.get('symbols') or []))} symbols")
     final_rows = apply_vibe_trading_review(final_rows, vibe_review)[:uzi_top]
-    buy_rows = select_buy_list(final_rows, buy_top)
+    buy3 = select_buy_list(final_rows, buy_top)
     final_rows = [prepare_report_row(row) for row in final_rows]
-    buy_rows = [prepare_report_row(row) for row in buy_rows]
-    watch = update_watchlist(final_rows, buy_rows, env)
-    write_json(OUTPUTS / "final_top10.json", final_rows)
-    write_json(OUTPUTS / "buy_top3.json", buy_rows)
+    buy3 = [prepare_report_row(row) for row in buy3]
     counts = {
         "universe": len(pool),
         "openbb": int(openbb_context.get("symbol_count") or 0),
@@ -7250,8 +8323,26 @@ def main() -> None:
         "research": len(trading),
         "committee": len(final_rows),
     }
-    run_mode = env.get("PIPELINE_RUN_MODE", "formal")
     should_send = args.send_telegram or env.get("PIPELINE_SEND_TELEGRAM", "1") == "1"
+    report_flow_status = build_flow_status(
+        env=env,
+        run_mode=run_mode,
+        counts=counts,
+        trading=trading,
+        uzi=uzi,
+        vibe_review=vibe_review,
+        final_report_written=True,
+        telegram_enabled=False,
+        telegram_sent=None,
+        ta_stage_meta=ta_stage_meta,
+    )
+    top10_for_report, buy3_for_report = apply_flow_status_to_report(final_rows, buy3, report_flow_status)
+    markdown = humanize_report_chinese(render_final_markdown(top10_for_report, buy3_for_report, counts, watch=None, flow_status=report_flow_status))
+    write_text(OUTPUTS / "final_top10.md", markdown)
+    write_json(OUTPUTS / "final_top10.json", top10_for_report)
+    write_json(OUTPUTS / "buy_top3.json", buy3_for_report)
+    write_text(OUTPUTS / "buy_top3.md", render_buy_markdown(buy3_for_report, counts))
+    update_watchlist(top10_for_report, buy3_for_report, env)
     flow_status = build_flow_status(
         env=env,
         run_mode=run_mode,
@@ -7262,27 +8353,42 @@ def main() -> None:
         final_report_written=True,
         telegram_enabled=should_send,
         telegram_sent=None,
+        ta_stage_meta=ta_stage_meta,
     )
-    markdown = humanize_report_chinese(
-        render_final_markdown(final_rows, buy_rows, counts, watch=watch, flow_status=flow_status)
-    )
-    write_text(OUTPUTS / "final_top10.md", markdown)
-    write_text(OUTPUTS / "buy_top3.md", render_buy_markdown(buy_rows, counts))
-    print(markdown)
-
-    write_json(OUTPUTS / "pipeline_status.json", flow_status)
+    persist_flow_status(flow_status, stage="final_report_done")
+    print(f"Final report written: {OUTPUTS / 'final_top10.md'} ({len(markdown)} chars)")
 
     if should_send:
         try:
-            text_to_send = telegram_text_for_status(markdown, flow_status)
-            telegram_send(env, text_to_send)
-            flow_status["telegram_sent"] = True
+            telegram_send(env, telegram_text_for_status(markdown, report_flow_status))
         except Exception:
-            flow_status["telegram_sent"] = False
-            write_json(OUTPUTS / "pipeline_status.json", flow_status)
+            failed_status = build_flow_status(
+                env=env,
+                run_mode=run_mode,
+                counts=counts,
+                trading=trading,
+                uzi=uzi,
+                vibe_review=vibe_review,
+                final_report_written=True,
+                telegram_enabled=True,
+                telegram_sent=False,
+                ta_stage_meta=ta_stage_meta,
+            )
+            persist_flow_status(failed_status, stage="telegram_failed")
             raise
-        write_json(OUTPUTS / "pipeline_status.json", flow_status)
-
+        flow_status = build_flow_status(
+            env=env,
+            run_mode=run_mode,
+            counts=counts,
+            trading=trading,
+            uzi=uzi,
+            vibe_review=vibe_review,
+            final_report_written=True,
+            telegram_enabled=True,
+            telegram_sent=True,
+            ta_stage_meta=ta_stage_meta,
+        )
+        persist_flow_status(flow_status, stage="telegram_done")
     print(f"Pipeline completed in {time.time() - started:.1f}s")
 
 
@@ -7293,7 +8399,7 @@ def render_buy_markdown(buy3: list[dict[str, Any]], counts: dict[str, int]) -> s
         f"# 今日买入 {len(buy3)} 只",
         "",
         f"生成日期：{today}",
-        f"漏斗：Universe {counts.get('universe', 0)} → OpenBB {counts.get('openbb', 0)} → 初筛 {counts.get('screen', 0)} → 深度研究 {counts.get('research', 0)} → 投委会 {counts.get('committee', 0)} → 买入 {len(buy3)}",
+        f"漏斗：股票池 {counts.get('universe', 0)} → 行情数据层 {counts.get('openbb', 0)} → 初筛 {counts.get('screen', 0)} → 深度投研 {counts.get('research', 0)} → 投委复核 {counts.get('committee', 0)} → 买入 {len(buy3)}",
         "",
     ]
     if not buy3:
@@ -7306,11 +8412,11 @@ def render_buy_markdown(buy3: list[dict[str, Any]], counts: dict[str, int]) -> s
         lines += [
             f"{idx}. {row.get('name') or row['symbol']} {row['symbol']}",
             f"结论：{row.get('buy_decision')}",
-            f"综合分：{row.get('total_score')}",
+            format_score_line(row),
             f"价格计划：{row.get('price_plan') or '暂无有效参考价，等下一轮日线数据补齐'}",
             f"买入：{row.get('buy_advice')}",
             f"卖出：{row.get('sell_advice')}",
-            f"仓位：{row.get('position_advice')}",
+            f"仓位：{format_position_advice(row)}",
             f"风控闸门：{row.get('quality_note') or '通过'}",
             f"理由：{complete_excerpt(row.get('reason', ''), 720)}",
             "",
@@ -7321,14 +8427,15 @@ def render_buy_markdown(buy3: list[dict[str, Any]], counts: dict[str, int]) -> s
 def _persist_failed_status(exc: Exception) -> None:
     try:
         prev = read_json_if_exists(OUTPUTS / "pipeline_status.json", {})
-        run_mode = (prev.get("run_mode") if isinstance(prev, dict) else None) or "formal"
-        write_json(OUTPUTS / "pipeline_status.json", {
-            "overall_status": "failed",
-            "can_publish_buy_report": False,
-            "run_mode": run_mode,
-            "blocking_reasons": [f"{type(exc).__name__}: {exc}"],
-            "error": {"type": type(exc).__name__, "message": str(exc)[:300]}
-        })
+        run_mode = prev.get("run_mode") or "formal"
+        stage = prev.get("stage") or "unknown"
+        write_stage_status(
+            run_mode=run_mode,
+            stage=stage,
+            overall_status="failed",
+            blocking_reasons=[f"{type(exc).__name__}: {exc}"][:1],
+            can_publish_buy_report=False,
+        )
     except Exception:
         pass
 
